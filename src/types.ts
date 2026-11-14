@@ -62,6 +62,12 @@ export interface ThreadRecord {
   roundStartSeq: number | null
   roundStartedAt: string | null
   lastReport: ThreadReport | null
+  /**
+   * `at` of the report already handed to the main conversation. A report is delivered as soon as
+   * it is recorded (the round may stay open while the thread keeps working), so the round's end
+   * must not send the same note twice.
+   */
+  reportSentAt?: string | null
   error: string | null
   /** Its own checkout when it was opened with `worktree: true`; otherwise it shares the project folder. */
   worktree: ThreadWorktree | null

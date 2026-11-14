@@ -131,15 +131,27 @@ describe('thread_propose', () => {
 })
 
 describe('thread_reply', () => {
-  it('sends the instruction to the thread by number and refuses unknown numbers', async () => {
+  it('steers the instruction into the thread by default and refuses unknown numbers', async () => {
     const t = setup()
     await t.manager.open('main', { title: 'a', task: 'x', initiation: 'user_asked' })
     await t.manager.onIdle('session-1')
     const tool = threadReplyTool(t.manager)
-    expect(await call(tool, { n: 1, message: '再加一个用例' })).toContain('已把追加指令发给讨论串 #1')
-    expect(t.agents.get('session-1')?.followups.at(-1)).toContain('再加一个用例')
+    expect(await call(tool, { n: 1, message: '再加一个用例' })).toContain('已把追加指令直接插给讨论串 #1')
+    expect(t.agents.get('session-1')?.steers.at(-1)).toContain('再加一个用例')
+    expect(t.agents.get('session-1')?.followups).toHaveLength(1)
     expect(await call(tool, { n: 7, message: 'x' })).toContain('没有发送：这个主对话没有讨论串 #7')
     await expect(call(tool, { n: '1', message: 'x' })).rejects.toBeInstanceOf(ToolArgsError)
+  })
+
+  it('queues it as the next turn when asked to, and refuses an unknown mode', async () => {
+    const t = setup()
+    await t.manager.open('main', { title: 'a', task: 'x', initiation: 'user_asked' })
+    await t.manager.onIdle('session-1')
+    const tool = threadReplyTool(t.manager)
+    expect(await call(tool, { n: 1, message: '之后再做 B', mode: 'followup' })).toContain('已把追加指令排给讨论串 #1')
+    expect(t.agents.get('session-1')?.followups.at(-1)).toContain('之后再做 B')
+    expect(t.agents.get('session-1')?.steers).toEqual([])
+    await expect(call(tool, { n: 1, message: 'x', mode: 'queue' })).rejects.toBeInstanceOf(ToolArgsError)
   })
 })
 
@@ -175,7 +187,7 @@ describe('thread_report', () => {
     expect(t.store.thread('session-1')?.lastReport).toBeNull()
   })
 
-  it('records a report made after the round ended and says it will be delivered, which is now true', async () => {
+  it('records a report made after the round ended and delivers it, which is now true', async () => {
     const t = setup()
     await t.manager.open('main', { title: 'a', task: 'x', initiation: 'user_asked' })
     const tool = threadReportTool(t.manager, 300)
@@ -184,7 +196,9 @@ describe('thread_report', () => {
     // DSH wakes the thread for the finished job; there is no round.
     await t.manager.onInbox('session-1', 'tool-jobs', 30, 'background job finished')
     const text = await call(tool, { status: 'done', summary: '后台任务已结束' }, 'session-1')
-    expect(text).toContain('结束本轮时会发给主对话')
+    // The report opened a round of its own, so it settles into a note like any other: the tool
+    // result promises the main conversation hears it without the thread doing anything more.
+    expect(text).toContain('不用等这一轮结束')
     await t.manager.onIdle('session-1')
     expect(t.main.followups).toHaveLength(2)
     expect(t.main.followups[1]).toContain('后台任务已结束')

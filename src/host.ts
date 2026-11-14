@@ -55,6 +55,7 @@ export function wrapAgent(agent: Agent): ThreadAgent {
     get status() { return agent.status },
     get seq() { return Number(agent.session.seq) },
     followup: (text, summary, meta) => agent.followup(noticeMessage(text, summary, meta)),
+    steer: (text, summary, meta) => agent.steer(noticeMessage(text, summary, meta)),
     inject: (text, summary, meta) => agent.inject(noticeMessage(text, summary, meta)),
   }
 }

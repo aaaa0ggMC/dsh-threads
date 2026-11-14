@@ -27,8 +27,9 @@ describe('decideDelivery', () => {
     expect(decideDelivery({ ...base, mainStatus: 'running' })).toBe('hold')
   })
 
-  it('holds while another thread of this main conversation is still running', () => {
-    expect(decideDelivery({ ...base, runningThreads: 1 })).toBe('hold')
+  it('still wakes for a finished thread while another thread is running', () => {
+    // A long-running sibling must not hold this thread's result back from the main conversation.
+    expect(decideDelivery({ ...base, runningThreads: 1 })).toBe('wake')
   })
 
   it('stops waking once the streak reaches the limit', () => {
@@ -71,14 +72,16 @@ describe('flushNotes', () => {
 
   // A thread's held report and the one it sent later, after a background job ended (src/manager.ts
   // recordReport): both are delivered, in order, so words the first carried are not lost. The
-  // later one says that it replaces the earlier.
+  // later one says that it replaces the earlier. Notes wait only while the main conversation is
+  // running: a sibling thread that is still running no longer holds them back (decideDelivery).
   it('delivers two notes of one thread together, oldest first', () => {
-    const { main, sent } = agent()
+    const busy = agent('running')
     const first = { threadId: 'session-1', text: '[#1 · done]\n摘要：构建已启动', quiet: false }
     const late = { threadId: 'session-1', text: '[#1 · failed]\n补交的回报\n摘要：构建失败', quiet: false }
-    const held = flushNotes(record([first, late]), main, 1, 5)
+    const held = flushNotes(record([first, late]), busy.main, 1, 5)
     expect(held.record.pendingNotes).toEqual([first, late])
-    const result = flushNotes(held.record, main, 0, 5)
+    const { main, sent } = agent()
+    const result = flushNotes(held.record, main, 1, 5)
     expect(sent.followup).toEqual([`${first.text}\n\n${late.text}`])
     expect(result.record).toMatchObject({ pendingNotes: [], autoWakeStreak: 1 })
   })

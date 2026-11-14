@@ -68,7 +68,7 @@ docs/Plan.md 定了方向：在 DeepSeek Harness（DSH）里做一个插件—�
 | `wrap_up` recap ≤300 字 | 讨论串专用工具 `thread_report`，`summary` ≤300 字 |
 | 便条取前 400 字 | 回报消息：标题 + 状态 + 摘要 + 改动文件 + 待你决定，截断到 400 字 |
 | side-sessions-event 唤醒 | 主会话 Agent 的 `followup`（唤醒）或 `inject`（只进上下文），加防循环计数 |
-| `SendMessage` 追加 | `thread_reply` → `ctx.sessionController.prompt` |
+| `SendMessage` 追加 | `thread_reply` → `resolveAgent` + `agent.steer`（默认，直接插入当前回合）/ `agent.followup`（排到下一轮） |
 | `list_sessions` | `thread_status` |
 | 侧栏一行 + 链接 | 讨论串本身就在侧栏；另加右侧栏"讨论串"标签页，点击用 `ctx.uiWorkspace.openSession(id)` 跳转 |
 | `use_worktree` | M3b：`thread_open { worktree: true }`，插件自己跑 `git worktree add`（见 M3b 落地情况） |
@@ -128,7 +128,10 @@ docs/Plan.md 定了方向：在 DeepSeek Harness（DSH）里做一个插件—�
   - 和用户在界面上点"新会话"走同一条路：自动挂 preset、归入工作区、出现在侧栏。
   - Agent 归会话控制器所有，**插件重载时讨论串不会被销毁**。
   - 不支持写父会话关联，所以"属于哪个主会话"记在插件自己的表里。
-- **发任务和追加**：`ctx.sessionController.prompt({ sessionId, content, requestId }, source)`，内部会走 `followup`。
+- **发任务和追加**：`ctx.sessionController.prompt({ sessionId, content, requestId }, source)` 内部会走 `followup`，但本插件不用它（它把 `source.kind` 写死成 `'user'`）：先用 `resolveAgent` 拿到 Agent，再用 `followup` / `steer` / `inject` 投递，见第五节的「追加指令改为可选 steer / followup」。
+  - `agent.followup(message)` = `send(message, 'next-turn', true)`：作为**下一轮**的唯一普通消息，运行中的会话要等这一轮结束才读到。
+  - `agent.steer(message)` = `send(message, 'next-step', true)`：运行中的会话在**下一个步边界**读到，空闲的会话直接开一轮。浏览器端输入框的 Ctrl/Cmd+Enter「插话发送」走的是同一件事（`dsh-api-session-controller` 的 `prompt({ mode: 'steer' })` 和 `updateQueue({ kind: 'steer' })`）。队列浮层只列 `inbox['next-turn']`，所以 steer 的消息不会显示成「排队消息」。
+  - `agent.inject(message)` = `send(message, 'next-step', false)`：只进上下文，不唤醒。
 - **拿 Agent**：`ctx.sessionController.resolveAgent(id)` → `{ agent } | { error }`。冷会话会自动恢复，所以重启后也能用。
 - **主会话所在的工作区**：`ctx.workspaceRegistry.list().find(w => w.sessionIds.includes(mainId))`。
 - **改标题**：`ctx.sessionTitle.rename(session, title)`。
@@ -197,7 +200,7 @@ docs/Plan.md 定了方向：在 DeepSeek Harness（DSH）里做一个插件—�
   - 返回讨论串序号和 id，或者提议的序号。
   - 超过并发上限时直接报错，告诉模型等某个讨论串结束。
 - `thread_status { n? }`：列出本主会话的讨论串和提议，或返回一个讨论串的最新回报。
-- `thread_reply { n, message }`：给讨论串追加指令；讨论串在运行时，消息排到下一轮。
+- `thread_reply { n, message, mode? }`：给讨论串追加指令。`mode: 'steer'`（默认）直接插进它正在做的事：运行中的讨论串在下一步就读到，不用等这一轮结束；`mode: 'followup'` 则排成它自己的下一轮，当前这一轮结束后才开始。空闲的讨论串两种都立刻开一轮。
 
 **讨论串的工具**
 - `thread_report { status: 'done' | 'blocked' | 'needs_decision' | 'failed', summary (≤300 字), changedFiles?, decisions? }`
@@ -225,11 +228,13 @@ docs/Plan.md 定了方向：在 DeepSeek Harness（DSH）里做一个插件—�
   - 都不是（DSH 自己开的一轮，比如讨论串留在后台的任务结束了）：不算一轮。讨论串在这样的一轮里调了 `thread_report`，这份回报自己开一轮，按上一轮的发起方投递；被用户停掉的讨论串例外，回报不收。见第五节“一轮结束之后补交的回报”。
 
 **唤醒规则（Delivery）**
-- 第 1 步，判断能不能唤醒：主会话 `idle`，且这个主会话派出的讨论串都不在运行，且 `autoWakeStreak < maxAutoWakes`。
+- 报告一落库就投递：讨论串调用 `thread_report` 时（`recordReport`）立刻把便条放进主对话的 `pendingNotes` 并 flush，不等这一轮结束。没打勾 TODO 的 agent 往往report完还继续干活，等回合结束会让结果长时间（甚至永远）到不了主对话。
+- 第 1 步，判断能不能唤醒：主会话 `idle`，且 `autoWakeStreak < maxAutoWakes`。**不再**要求其它讨论串都停下——别的讨论串在跑不能扣住一个已经完成的讨论串的结果。
 - 第 2 步，能唤醒：把所有待发便条合成一条消息，用 `followup` 发出，然后 `autoWakeStreak + 1`。
 - 第 3 步，主会话正在运行：先不发。主会话变成 `idle` 时，再回到第 1 步判断。
 - 第 4 步，达到唤醒上限：改用 `inject`，只进上下文不唤醒；面板上标出"等待你回来"。
 - 计数清零：主会话收到真实用户消息时，`autoWakeStreak` 归零。
+- 去重：投递过的报告记在 `reportSentAt`，回合结束的 `settle` 不再重复发同一条便条。
 
 **系统提示**
 - 给主会话（dispatcher），内容改写自第一节的 Claude 规则：
@@ -444,7 +449,7 @@ dsh-thread/                    # 本地目录名不变；GitHub 仓库叫 dsh-th
 宿主端：
 - 新增 `projects.ts`（新建、改名、置顶、移除、列表统计）和 `projects` 表；新字段都带默认值，M1 的旧记录照常能读。
 - `install.ts` 按角色挂载（`roles.ts`）：项目主对话 = dispatcher，讨论串 = thread，其他 = none；项目变动后，正在运行的会话会重新计算角色。
-- 新增 `thread_reply`：讨论串空闲时开新一轮；正在跑时排到下一轮，结果按唤醒规则回报。
+- 新增 `thread_reply`：讨论串空闲时开新一轮；正在跑时排到下一轮，结果按唤醒规则回报。（2026-11-04 改成默认 `steer` 直接插入当前回合，见下面的「追加指令改为可选 steer / followup」。）
 - 新增 `recover()`：启动时把 `starting` 的讨论串标记为 failed；`running` 的用 `resolveAgent` 拿回 Agent，空闲就结算；待发的便条重新投递。
 - `api.ts` 提供 `projects.*`、`sessions.role`、`threads.list`。
 
@@ -497,7 +502,7 @@ dsh-thread/                    # 本地目录名不变；GitHub 仓库叫 dsh-th
 #### M2c 落地情况（2026-10-23，分支 `feat/thread-cards`）
 
 主对话里的卡片：
-- 我们发进收件箱的每条消息（简报、追加、回报）在来源上带 `role`、`threads`（`threadId`、`n`、`title`，回报还有状态和摘要）和 `wake`（是开了新一轮，还是只进上下文）。
+- 我们发进收件箱的每条消息（简报、追加、回报）在来源上带 `role`、`threads`（`threadId`、`n`、`title`，回报还有状态和摘要）和 `wake`（会唤醒的投递：`followup` / `steer` 为 true，`inject` 为 false）。
 - 浏览器端用 `ctx.uiConversation.events.register` 注册 `noticeDefinition`：独占匹配 `source.kind === 'dsh-threads'` 的 `user/message`，生成节点 `dsh-threads-notice`，`conversation.chat.node` 渲染成卡片：
   - 回报："讨论串回报（N）"，每个讨论串一行：状态点、`#n 标题 · 状态`、摘要（去掉 markdown 标记）、"查看讨论串"；
   - 简报和追加："来自主对话的任务 / 追加指令 · #n 标题"，正文折叠显示。
@@ -980,7 +985,7 @@ v0.1.0 阶段 1 合并后，在 test1 跑完整流程时，主对话没让合并
 - 讨论串的系统提示要求每次回复结束前都调 `thread_report`，所以被叫醒的讨论串通常会回报；它交的就是这件任务真正的结果，主对话作为项目负责人需要它。
 - 由回报触发，不由收件箱里那条通知触发。只凭一条不是 `user` 的消息就开一轮，要是那条消息没有真的开出一轮（别的插件对空闲会话 `inject`），讨论串会一直停在 `running`，挡住这个主对话所有的唤醒，还占一个 `maxRunning` 名额。回报是在正在跑的一轮里调的工具，后面一定有 `idle`，一定能结算。也不依赖通知的 `source.kind` 具体叫什么。
 - DSH 开的这一轮里讨论串没回报：什么都不发，也不提醒。没有新回报，主对话知道的和记录一致；为“后台任务结束了，没什么要说的”再叫醒两边不值得。
-- 响还是静，跟上一轮走（新字段 `lastRound`）：上一轮是主对话派的，后台任务是那件任务的一部分，按唤醒规则投递（主对话空闲且没有别的讨论串在跑才唤醒，否则先留着；受 `maxAutoWakes` 限制，超过后只 `inject`）；上一轮是用户自己在讨论串里发起的，用户就在那儿看着，安静投递，和用户发起的轮次一样。
+- 响还是静，跟上一轮走（新字段 `lastRound`）：上一轮是主对话派的，后台任务是那件任务的一部分，按唤醒规则投递（主对话空闲才唤醒，在跑就先留着；**不再**要求其它讨论串都停下，见「追加指令改为可选 steer / followup」同一轮的投递改动；受 `maxAutoWakes` 限制，超过后只 `inject`）；上一轮是用户自己在讨论串里发起的，用户就在那儿看着，安静投递，和用户发起的轮次一样。
 - 被用户停掉的讨论串不变：`stopped` 时回报照旧拒收，保持“已停止”（上一节）。
 
 **做法**：
@@ -1004,6 +1009,23 @@ v0.1.0 阶段 1 合并后，在 test1 跑完整流程时，主对话没让合并
 - DSH 开的那一轮，从开始到讨论串调 `thread_report` 之前，记录里还是 `idle`：这段时间别的讨论串结算时不会等它，主对话可能被先后唤醒两次，而不是合成一次。
 - 用户在讨论串**还没回报**时停掉 DSH 开的这一轮：这一轮不算一轮，所以讨论串不会被记成“已停止”，下一个后台任务结束时它还能回报。回报之后停的，会按“已停止”结算。
 - 没有“进行中”这种回报状态：后台任务没结束就结束一轮的讨论串，第一份回报只能用现有的四种状态之一，靠摘要说明结果还没出来。
+
+#### 追加指令改为可选 steer / followup（2026-11-04）
+
+用户报的问题：主对话给正在运行的讨论串发追加指令（`thread_reply`）时，消息只是排进收件箱的 `next-turn`，界面把它显示成输入框上方的“排队消息”一行，要等讨论串当前这一轮结束才会被读到；回合长的时候要好几分钟，改一句要求却“不具备时效性”。用户的意思是让主对话自己决定这次要排下一轮，还是直接插进去。
+
+DSH 的两种投递（核对的是 `@deepseek-ai/dsh-agent` 的类型声明和 `dsh-agent-loop` 的 `AgentLoop`；运行时装的是 0.2.1-rc.5，类型锁的是 rc.2，两边都有）：
+- `agent.followup(message)` = `send(message, 'next-turn', true)`：成为下一轮的唯一普通消息，运行中的会话要等这一轮结束。
+- `agent.steer(message)` = `send(message, 'next-step', true)`：运行中的会话在下一个步边界读到；空闲的会话直接开一轮。浏览器端 Ctrl/Cmd+Enter「插话发送」用的就是这个（`dsh-api-session-controller` 的 `prompt({ mode: 'steer' })`、`updateQueue({ kind: 'steer' })`）。
+- 步边界指模型每次请求之前（`preStep` 里 `inbox.claim('next-step')`）。如果当前轮在最后一步，插话会留在收件箱里；`turn()` 结尾看到 `inbox.hasPending` 会接着开一轮把它带走，不会丢。
+- 浏览器端的排队浮层只列 `inbox['next-turn']`（`dsh-client-ui-conversation` 的 InputZone 队列快照），所以 steer 的消息不会显示成“排队消息”，而是下一步直接出现在讨论串的对话里；我们的 `noticeDefinition` 照旧把它渲染成“追加指令”卡片（`role: 'reply'`、`wake: true`）。
+
+改动：
+- `thread_reply` 增加可选参数 `mode: 'steer' | 'followup'`，**默认 `steer`**；`manager.reply(mainSessionId, n, message, mode)` 按模式调 `agent.steer` / `agent.followup`。空闲的讨论串两种都立刻开一轮（steer 在空闲时也会唤醒），所以 `followup` 只在“这是下一件事、要等当前这件事做完”时才有意义。
+- `ThreadAgent`（`src/manager.ts`）和 `src/host.ts` 的 `wrapAgent` 增加 `steer`；通知消息的来源元数据不变。
+- 工具描述、`src/prompts.ts` 的“Follow-ups: thread_reply”都写明什么时候用哪个；工具结果分开成“已把追加指令直接插给讨论串”和“已把追加指令排给讨论串……作为下一轮处理”，让模型知道自己刚才选的是哪种。
+- 测试：`FakeAgent` 增加 `steers`；`ThreadManager.reply` 覆盖默认 steer 和显式 followup；`thread_reply` 覆盖默认、显式 followup、拒绝未知 mode。
+- 实机验证（待做）：在用的 DSH 里发 `thread_reply`，正在运行的讨论串应在一两步内读到（不再出现在排队消息一行），并照常回报。
 
 ## 六、验证
 
@@ -1044,7 +1066,7 @@ v0.1.0 阶段 1 合并后，在 test1 跑完整流程时，主对话没让合并
 | `permissionPresets.current()` 对不上任何模式时返回 `custom`；`set()` 只接受真实模式名；新会话由 `pinInitialPermission` 钉成用户默认模式（0.2.1 在 `session/created`，0.2.2 在 `agent/created`，都早于我们的 `set()`） | 讨论串沿用主对话的审批模式 | 讨论串开不出来，或者用了更宽的默认模式 |
 | 用户停止的一轮以 `turn/end`、`reason: { kind: 'aborted', reason: { kind: 'user' } }` 结束 | `host.stoppedByUser`：停掉的一轮不提醒 | 停掉的讨论串又被“提醒回报”叫醒 |
 | 停止一轮不结束会话的后台任务；任务结束时 `dsh-tool-jobs` 用 `source.kind = 'tool-jobs'`（不是 `user`）的消息唤醒空闲会话 | `manager.onInbox` 只把 `user` 消息当成新的一轮；`stopped` 的讨论串在这种轮次里拒收 `thread_report`，并带上 `dsh-threads-stopped` 上下文；没被停的讨论串在这种轮次里交的回报另开一轮投递（`recordReport`） | DSH 的通知如果改成 `user` 来源，停掉的讨论串会被当成用户让它继续：回报照收、状态翻成“已完成” |
-| `agent.cancel({ kind: 'user' })` 不带 `keepInbox` 会丢掉排队的输入 | “停止”按钮和 `/thread stop` | 停止后讨论串接着跑排队的追加指令 |
+| `agent.cancel({ kind: 'user' })` 不带 `keepInbox` 会丢掉排队的输入 | “停止”按钮和 `/thread stop` | 停止后讨论串接着跑排队的追加指令（插话中、还没被读到的也会一起丢） |
 | `agent.session.snapshotEvents(seq)` 加 `finalAssistantOutput`（`dsh-subagent`） | 没回报时用最后一条回复兜底；通知正文 | 兜底和通知正文变空 |
 | 没有 `groupTree` 的聊天节点在已结束的轮里会被过滤（`dsh-client-ui-chat`） | 讨论串卡片设 `groupTree: 'input' / 'turn'` | 卡片在历史轮次里消失 |
 | 命令记成 `command/run`（`name`、`args`）和 `command/done`（`kind`、`text`，没有命令名），DSH 画成一行；聊天视图只要有一个不是 `command` 的节点就算“有内容”，宿主只在 `turn/start` 时把会话从 blank 改掉，只有命令的对话停在欢迎页 | `threadCommandDefinition`：`/thread` 那一行下面的讨论串卡片，也让新项目第一条 `/thread` 离开欢迎页；讨论串编号从 `/thread` 自己的回复里读 | 卡片不出现，新项目第一条 `/thread` 又像没反应 |

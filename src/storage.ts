@@ -29,6 +29,7 @@ const threadSchema = z.object({
   roundStartSeq: z.number().int().nonnegative().nullable(),
   roundStartedAt: z.string().nullable(),
   lastReport: reportSchema.nullable(),
+  reportSentAt: z.string().nullable().default(null),
   error: z.string().nullable(),
   worktree: z.object({
     path: z.string(),

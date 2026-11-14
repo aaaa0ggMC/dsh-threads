@@ -10,10 +10,12 @@ export class FakeAgent implements ThreadAgent {
   status: 'idle' | 'running' = 'idle'
   seq = 0
   followups: string[] = []
+  steers: string[] = []
   injects: string[] = []
   metas: (NoticeMeta | undefined)[] = []
   constructor(readonly id: string) {}
   followup(text: string, _summary: string, meta?: NoticeMeta) { this.followups.push(text); this.metas.push(meta) }
+  steer(text: string, _summary: string, meta?: NoticeMeta) { this.steers.push(text); this.metas.push(meta) }
   inject(text: string, _summary: string, meta?: NoticeMeta) { this.injects.push(text); this.metas.push(meta) }
 }
 

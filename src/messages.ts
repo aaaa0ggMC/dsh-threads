@@ -133,9 +133,10 @@ const zh = {
   toolOpened: (n: number, title: string, id: string, worktree: string) =>
     `已开讨论串 #${n}「${title}」（会话 ${id}），它在后台运行，用户可以在侧栏点开它。${worktree}它做完会把摘要发回这里；不要等待或轮询，继续做别的事或结束本轮。`,
   toolNotOpened: (reason: string) => `没有开讨论串：${reason}`,
-  toolReplied: (n: number, title: string) => `已把追加指令发给讨论串 #${n}「${title}」。它做完会再回报；不要等待或轮询。`,
+  toolRepliedSteer: (n: number, title: string) => `已把追加指令直接插给讨论串 #${n}「${title}」：它下一步就会读到，不用等这一轮结束。它做完会再回报；不要等待或轮询。`,
+  toolRepliedFollowup: (n: number, title: string) => `已把追加指令排给讨论串 #${n}「${title}」：它正在跑时会作为下一轮处理（当前这一轮结束后开始），空闲时两种方式都是立刻开跑。它做完会再回报；不要等待或轮询。`,
   toolNotSent: (reason: string) => `没有发送：${reason}`,
-  toolReported: '回报已记录，结束本轮时会发给主对话。现在用一两句话结束回复，不要再调用工具。',
+  toolReported: '回报已记录，并且已经发给主对话（不用等这一轮结束）。现在用一两句话结束回复，不要再调用工具。',
   toolProposed: (titles: readonly string[]) =>
     `已把 ${titles.length} 个提议放进输入框上方的卡片：${titles.map((title) => `「${title}」`).join('、')}。用户勾选后才会开讨论串；不要等待，也不要在回复里重复列出。`,
   toolNotProposed: (reason: string) => `没有提议：${reason}`,
@@ -263,9 +264,10 @@ const en: Messages = {
   toolOpened: (n, title, id, worktree) =>
     `Opened thread #${n} "${title}" (session ${id}). It runs in the background and the user can open it from the sidebar. ${worktree}Its summary comes back here when it is done; do not wait or poll, carry on with other work or end your turn.`,
   toolNotOpened: (reason) => `Thread not opened: ${reason}`,
-  toolReplied: (n, title) => `Sent the follow-up to thread #${n} "${title}". It reports again when it is done; do not wait or poll.`,
+  toolRepliedSteer: (n, title) => `Sent the follow-up straight into thread #${n} "${title}": it reads it at its next step, without waiting for the thread's current turn to end. It reports again when it is done; do not wait or poll.`,
+  toolRepliedFollowup: (n, title) => `Queued the follow-up for thread #${n} "${title}": while it is running, it becomes its own next turn after the thread's current turn ends; an idle thread starts either mode right away. It reports again when it is done; do not wait or poll.`,
   toolNotSent: (reason) => `Not sent: ${reason}`,
-  toolReported: 'Report recorded; it goes to the main conversation when this round ends. Finish your reply in a sentence or two and call no more tools.',
+  toolReported: 'Report recorded and already sent to the main conversation, without waiting for this round to end. Finish your reply in a sentence or two and call no more tools.',
   toolProposed: (titles) =>
     `Put ${titles.length} suggestion(s) in the card above the composer: ${titles.map((title) => `"${title}"`).join(', ')}. Threads open only when the user picks them; do not wait, and do not list them again in your reply.`,
   toolNotProposed: (reason) => `No suggestions made: ${reason}`,

@@ -15,10 +15,13 @@ export interface DeliveryInput {
   maxAutoWakes: number
 }
 
-/** What to do with pending loud notes right now. */
+/**
+ * What to do with pending loud notes right now. Only the main conversation's own turn holds
+ * them: a note from a finished thread must not wait behind unrelated threads that are still
+ * running, or the main conversation never hears a finished thread while another one is long.
+ */
 export function decideDelivery(input: DeliveryInput): DeliveryAction {
   if (input.mainStatus === 'running') return 'hold'
-  if (input.runningThreads > 0) return 'hold'
   if (input.autoWakeStreak >= input.maxAutoWakes) return 'quiet'
   return 'wake'
 }

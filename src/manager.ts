@@ -3,7 +3,7 @@ import type { MainAgent } from './delivery.ts'
 import { flushNotes } from './delivery.ts'
 import { msg } from './messages.ts'
 import { composeNote, currentReport, normalizeReport, noticeSummary, plainLine, truncate } from './report.ts'
-import type { ThreadCardInfo } from './source.ts'
+import type { NoticeMeta, ThreadCardInfo } from './source.ts'
 import type { ThreadStore } from './store.ts'
 import type { Initiation, ModelChoice, PendingNote, ProposalRecord, ThreadRecord, ThreadReport, ThreadWorktree } from './types.ts'
 import { type RemoveResult, worktreeFolder } from './worktree.ts'
@@ -25,6 +25,12 @@ export interface ThreadAgent extends MainAgent {
   readonly id: string
   /** Current session log offset. */
   readonly seq: number
+  /**
+   * Hand the message to the thread's current work: a running thread reads it at its next step
+   * boundary (no waiting for the turn to end); an idle thread starts a turn. `meta` lets the
+   * transcript render thread cards.
+   */
+  steer(text: string, summary: string, meta?: NoticeMeta): void
 }
 
 /** DSH services behind the manager (src/host.ts adapts the real ones). */
@@ -79,6 +85,9 @@ export interface ManagerDeps {
 
 /** A refusal the model should read and act on (not a bug). */
 export class ThreadError extends Error {}
+
+/** How thread_reply puts its message into the thread: into the current work, or as its next turn. */
+export type ReplyMode = 'steer' | 'followup'
 
 const TITLE_MAX = 30
 
@@ -206,7 +215,7 @@ export class ThreadManager {
       resolved: false,
       archived: false,
       round: null, userMessages: [], roundStartSeq: null, roundStartedAt: null,
-      lastReport: null, error: null,
+      lastReport: null, reportSentAt: null, error: null,
       worktree,
       reminder: null,
       stopped: false,
@@ -252,11 +261,13 @@ export class ThreadManager {
   }
 
   /**
-   * thread_reply: send a thread more instructions. An idle thread starts a new dispatched
-   * round; a running one gets the message as its next turn, and its result is reported
-   * with wake-up rules even if the user started the current round.
+   * thread_reply: send a thread more instructions. `steer` (the default) hands the message to
+   * the thread's current work, so a running thread reads it at its next step instead of after
+   * the turn; `followup` queues it as the thread's own next turn. An idle thread starts a
+   * dispatched round either way, and its result is reported with wake-up rules even if the
+   * user started the current round.
    */
-  async reply(mainSessionId: string, n: number, message: string): Promise<ThreadRecord> {
+  async reply(mainSessionId: string, n: number, message: string, mode: ReplyMode = 'steer'): Promise<ThreadRecord> {
     const text = message.trim()
     if (text.length === 0) throw new ThreadError(msg().emptyMessage)
     const thread = this.deps.store.threadsOf(mainSessionId).find((t) => t.n === n)
@@ -275,7 +286,11 @@ export class ThreadManager {
       // A round the thread's own late report opened becomes an ordinary task round.
       : { ...current, round: 'dispatch', resolved: false, reminder: null, stopped: false, late: false, updatedAt: at }
     await this.deps.store.putThread(next)
-    agent.followup(replyText(next, text), noticeSummary(next, msg().noticeReply), { role: 'reply', threads: [cardOf(next)], wake: true })
+    const notice = replyText(next, text)
+    const summary = noticeSummary(next, msg().noticeReply)
+    const meta: NoticeMeta = { role: 'reply', threads: [cardOf(next)], wake: true }
+    if (mode === 'followup') agent.followup(notice, summary, meta)
+    else agent.steer(notice, summary, meta)
     return next
   }
 
@@ -385,29 +400,19 @@ export class ThreadManager {
    */
   private async settle(thread: ThreadRecord, stopped = false): Promise<void> {
     const report = currentReport(thread)
+    await this.deps.store.putThread({ ...thread, status: 'idle', round: null, userMessages: [], reminder: null, stopped, lastRound: thread.round, late: false, updatedAt: this.deps.now() })
+    // A report already handed over when it was recorded is not sent again at the round's end —
+    // unless the round then ended in a way the main conversation has not been told about yet: the
+    // user stopped it (that is the user's call, and it decides what may be reopened), or the
+    // model call failed. Both override the de-duplication.
+    if (report !== null && thread.reportSentAt === report.at && !stopped) {
+      await this.drainQueue(thread.mainSessionId)
+      return
+    }
     const fallback = report !== null ? undefined
       : thread.reminder !== null ? thread.reminder.fallback ?? undefined
       : this.deps.host.roundOutput(thread.id, thread.roundStartSeq ?? 0)
-    const note: PendingNote = {
-      threadId: thread.id,
-      text: composeNote(thread, report, fallback, this.deps.config.noteMaxChars, { stopped, late: thread.late }),
-      quiet: thread.round === 'user' || stopped,
-      card: {
-        ...cardOf(thread),
-        status: stopped ? 'stopped' : report?.status ?? 'no-report',
-        summary: truncate(plainLine(report?.summary ?? fallback ?? ''), CARD_SUMMARY_MAX),
-        ...(report?.decisions[0] === undefined ? {} : { decision: truncate(report.decisions[0], CARD_SUMMARY_MAX) }),
-        ...(report === null || report.changedFiles.length === 0 ? {} : { files: report.changedFiles.slice(0, CARD_FILES_MAX) }),
-      },
-    }
-    await this.deps.store.putThread({ ...thread, status: 'idle', round: null, userMessages: [], reminder: null, stopped, lastRound: thread.round, late: false, updatedAt: this.deps.now() })
-    // Start queued proposals first: the note then waits for them, and the main conversation
-    // hears from the whole batch once instead of once per thread.
-    await this.drainQueue(thread.mainSessionId)
-    await this.serial(thread.mainSessionId, async () => {
-      const main = this.deps.store.main(thread.mainSessionId)
-      await this.deps.store.putMain({ ...main, pendingNotes: [...main.pendingNotes, note] })
-    })
+    await this.queueNote(thread, this.noteOf(thread, report, fallback, stopped, thread.late))
   }
 
   /**
@@ -569,15 +574,59 @@ export class ThreadManager {
     const report = normalizeReport(input, config.summaryMaxChars, now())
     // A deleted project's thread is an ordinary conversation: there is nobody to deliver to.
     const late = thread.round === null && thread.status !== 'failed' && thread.status !== 'starting' && !thread.stopped && this.isDispatcher(thread.mainSessionId)
-    await store.putThread(late
+    const next: ThreadRecord = late
       ? {
           ...thread,
           status: 'running', round: thread.lastRound ?? 'dispatch', late: true, userMessages: [], reminder: null,
           roundStartSeq: seq ?? thread.roundStartSeq, roundStartedAt: report.at,
           lastReport: report, updatedAt: report.at,
         }
-      : { ...thread, lastReport: report, updatedAt: report.at })
+      : { ...thread, lastReport: report, updatedAt: report.at }
+    await store.putThread(next)
+    // Hand it over now rather than at the round's end: a thread that leaves TODOs unticked often
+    // keeps working (or keeps a turn open), so waiting for the end can keep the result from the
+    // main conversation for a long time. The round stays open; `settle` skips this report. A
+    // report that arrived outside any round just opened one of its own (above), so it is
+    // delivered when that round settles, the way the thread's last round was delivered.
+    if (next.round !== null && !late) await this.deliverReport(next)
     return report
+  }
+
+  /** Send the round's recorded report now, without closing the round. */
+  private async deliverReport(thread: ThreadRecord): Promise<void> {
+    const report = currentReport(thread)
+    if (report === null || thread.reportSentAt === report.at) return
+    const next: ThreadRecord = { ...thread, reportSentAt: report.at }
+    await this.deps.store.putThread(next)
+    await this.queueNote(next, this.noteOf(next, report, undefined, false, false))
+    await this.flush(thread.mainSessionId)
+  }
+
+  /** The note a round's outcome becomes; `settle` and `deliverReport` share it. */
+  private noteOf(thread: ThreadRecord, report: ThreadReport | null, fallback: string | undefined, stopped: boolean, late: boolean): PendingNote {
+    return {
+      threadId: thread.id,
+      text: composeNote(thread, report, fallback, this.deps.config.noteMaxChars, { stopped, late }),
+      quiet: thread.round === 'user' || stopped,
+      card: {
+        ...cardOf(thread),
+        status: stopped ? 'stopped' : report?.status ?? 'no-report',
+        summary: truncate(plainLine(report?.summary ?? fallback ?? ''), CARD_SUMMARY_MAX),
+        ...(report?.decisions[0] === undefined ? {} : { decision: truncate(report.decisions[0], CARD_SUMMARY_MAX) }),
+        ...(report === null || report.changedFiles.length === 0 ? {} : { files: report.changedFiles.slice(0, CARD_FILES_MAX) }),
+      },
+    }
+  }
+
+  /** Put one note into its main conversation's queue, after starting queued proposals. */
+  private async queueNote(thread: ThreadRecord, note: PendingNote): Promise<void> {
+    // Start queued proposals first: the note then waits for them, and the main conversation
+    // hears from the whole batch once instead of once per thread.
+    await this.drainQueue(thread.mainSessionId)
+    await this.serial(thread.mainSessionId, async () => {
+      const main = this.deps.store.main(thread.mainSessionId)
+      await this.deps.store.putMain({ ...main, pendingNotes: [...main.pendingNotes, note] })
+    })
   }
 
   /** Deliver held notes if the rules allow it now. */

@@ -55,6 +55,20 @@ describe('ThreadManager', () => {
     expect(t.store.main('main').autoWakeStreak).toBe(1)
   })
 
+  it('delivers a report as soon as the thread records it, without waiting for the round to end', async () => {
+    // A thread that leaves TODOs unticked often keeps working after reporting; the main
+    // conversation must hear the result anyway, or it can never schedule the next step.
+    await t.manager.open('main', { title: 'a', task: 'x', initiation: 'user_asked' })
+    await t.manager.recordReport('session-1', { status: 'done', summary: '先做到这里', changedFiles: [], decisions: [] })
+    expect(t.main.followups).toHaveLength(1)
+    expect(t.main.followups[0]).toContain('先做到这里')
+    // The round is still open; ending it later does not send the same report twice.
+    expect(t.store.thread('session-1')).toMatchObject({ status: 'running', round: 'dispatch', reportSentAt: t.store.thread('session-1')!.lastReport!.at })
+    await t.manager.onIdle('session-1')
+    expect(t.main.followups).toHaveLength(1)
+    expect(t.store.thread('session-1')).toMatchObject({ status: 'idle', round: null })
+  })
+
   it('falls back to the last reply when the thread did not report', async () => {
     await t.manager.open('main', { title: 'a', task: 'x', initiation: 'user_asked' })
     t.outputs.set('session-1', '做完了，但忘了回报')
@@ -353,20 +367,22 @@ describe('a thread that reports again after its round ended', () => {
     expect(thread.followups).toHaveLength(1)
   })
 
-  it('holds the late report while another thread is running, then delivers both together', async () => {
+  it('delivers the late report even while another thread is running', async () => {
     const thread = await reportedOnce()
     await t.manager.open('main', { title: 'b', task: 'y', initiation: 'user_asked' })
     await jobWakes(thread)
     await t.manager.recordReport('session-1', report('构建通过'))
     thread.status = 'idle'
     await t.manager.onIdle('session-1')
-    expect(t.main.followups).toHaveLength(1)
-    expect(t.store.main('main').pendingNotes).toHaveLength(1)
-    await t.manager.recordReport('session-2', report('b 做完了'))
-    await t.manager.onIdle('session-2')
+    // A finished thread's result is not held behind a sibling that is still running: the main
+    // conversation hears about each thread as it finishes, in its own wake-up.
     expect(t.main.followups).toHaveLength(2)
     expect(t.main.followups[1]).toContain('构建通过')
-    expect(t.main.followups[1]).toContain('b 做完了')
+    expect(t.store.main('main').pendingNotes).toEqual([])
+    await t.manager.recordReport('session-2', report('b 做完了'))
+    await t.manager.onIdle('session-2')
+    expect(t.main.followups).toHaveLength(3)
+    expect(t.main.followups[2]).toContain('b 做完了')
   })
 
   it('stops waking at maxAutoWakes: the late report is put in quietly', async () => {
@@ -485,7 +501,7 @@ describe('ThreadManager.reply', () => {
   let t: ReturnType<typeof setup>
   beforeEach(() => { t = setup() })
 
-  it('starts a new dispatched round on an idle thread and reopens it', async () => {
+  it('starts a new dispatched round on an idle thread and steers it by default', async () => {
     await t.manager.open('main', { title: 'a', task: 'x', initiation: 'user_asked' })
     await t.manager.onIdle('session-1')
     await t.store.putThread({ ...t.store.thread('session-1')!, resolved: true })
@@ -493,7 +509,18 @@ describe('ThreadManager.reply', () => {
     thread.seq = 42
     await t.manager.reply('main', 1, '再补一个测试')
     expect(t.store.thread('session-1')).toMatchObject({ status: 'running', round: 'dispatch', roundStartSeq: 42, resolved: false })
-    expect(thread.followups.at(-1)).toContain('再补一个测试')
+    expect(thread.steers.at(-1)).toContain('再补一个测试')
+    // The reply is steered, not queued as another turn behind the brief.
+    expect(thread.followups.some((text) => text.includes('再补一个测试'))).toBe(false)
+  })
+
+  it('can queue the instruction as the thread\'s own next turn', async () => {
+    await t.manager.open('main', { title: 'a', task: 'x', initiation: 'user_asked' })
+    await t.manager.onIdle('session-1')
+    const thread = t.agents.get('session-1')!
+    await t.manager.reply('main', 1, '下一件事做 B', 'followup')
+    expect(thread.followups.at(-1)).toContain('下一件事做 B')
+    expect(thread.steers).toEqual([])
   })
 
   it('upgrades a user-driven round so its result wakes the main conversation', async () => {
@@ -502,6 +529,9 @@ describe('ThreadManager.reply', () => {
     await t.manager.onInbox('session-1', 'user', 5)
     await t.manager.reply('main', 1, '顺便看下 B')
     expect(t.store.thread('session-1')).toMatchObject({ round: 'dispatch', roundStartSeq: 5 })
+    // The bug this fixes: a running thread must get the message into its current work
+    // (steer), not queued behind the turn it is still working on (followup).
+    expect(t.agents.get('session-1')?.steers.at(-1)).toContain('顺便看下 B')
     await t.manager.onIdle('session-1')
     expect(t.main.followups).toHaveLength(2)
   })
@@ -612,7 +642,7 @@ describe('parallel threads', () => {
     expect(t.store.threadsOf('main').map((thread) => thread.n)).toEqual([1, 2])
   })
 
-  it('holds reports until every thread is done, even when two finish at the same moment', async () => {
+  it('tells the main conversation about each thread as it finishes, even while another runs', async () => {
     const t = setup({}, { slowMain: true })
     await t.manager.open('main', { title: 'a', task: 'a', initiation: 'user_asked' })
     await t.manager.open('main', { title: 'b', task: 'b', initiation: 'user_asked' })
@@ -620,8 +650,10 @@ describe('parallel threads', () => {
     // b finishes while a's report is still on its way to the main conversation.
     await new Promise((resolve) => setTimeout(resolve, 0))
     await Promise.all([first, t.manager.onIdle('session-2')])
-    expect(t.main.followups).toHaveLength(1)
-    expect(t.main.metas[0]?.threads.map((card) => card.title)).toEqual(['a', 'b'])
+    // a's report is delivered while b is still running; each thread gets its own wake-up.
+    expect(t.main.followups).toHaveLength(2)
+    expect(t.main.followups[0]).toContain('no-report')
+    expect(t.main.metas.map((meta) => meta?.threads.map((card) => card.title))).toEqual([['a'], ['b']])
   })
 
   it('starts each queued proposal once when two threads free their slots together', async () => {
@@ -632,7 +664,8 @@ describe('parallel threads', () => {
     await Promise.all([t.manager.onIdle(first!.id), t.manager.onIdle(second!.id)])
     expect(t.store.threadsOf('main').map((thread) => thread.title)).toEqual(['A', 'B', 'C'])
     expect(t.manager.runningCount('main')).toBe(1)
-    expect(t.main.followups).toHaveLength(0)
+    // The first finished thread's note is not held behind the proposal that just started.
+    expect(t.main.followups).toHaveLength(1)
   })
 })
 
@@ -744,11 +777,11 @@ describe('proposals', () => {
     await t.manager.onIdle('session-3')
     expect(t.store.proposal(b!.id)).toMatchObject({ state: 'started' })
     expect(t.manager.runningCount('main')).toBe(1)
-    // A's report waits for B, which the queue started, so the batch arrives as one wake-up.
-    expect(t.main.followups).toHaveLength(0)
-    await t.manager.onIdle('session-4')
+    // A's report reaches the main conversation now, without waiting for the queue's B.
     expect(t.main.followups).toHaveLength(1)
-    expect(t.main.metas[0]?.threads.map((card) => card.title)).toEqual(['A', 'B'])
+    await t.manager.onIdle('session-4')
+    expect(t.main.followups).toHaveLength(2)
+    expect(t.main.metas[0]?.threads.map((card) => card.title)).toEqual(['A'])
   })
 
   it('dismisses proposals and drops expired ones from the list', async () => {

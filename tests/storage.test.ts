@@ -18,7 +18,7 @@ describe('stored records from earlier versions', () => {
       status: 'idle', round: null, roundStartSeq: 3, roundStartedAt: '2026-10-23T20:00:00.000Z',
       lastReport: report, error: null, createdAt: '2026-10-23T20:00:00.000Z', updatedAt: '2026-10-23T20:00:00.000Z',
     }
-    expect(table('threads').parse(m1)).toEqual({ ...m1, resolved: false, archived: false, userMessages: [], worktree: null, reminder: null, stopped: false, lastRound: null, late: false })
+    expect(table('threads').parse(m1)).toEqual({ ...m1, resolved: false, archived: false, userMessages: [], worktree: null, reminder: null, stopped: false, lastRound: null, late: false, reportSentAt: null })
   })
 
   it('reads a worktree written before subfolders were recorded', () => {
