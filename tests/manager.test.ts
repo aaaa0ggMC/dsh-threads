@@ -556,6 +556,51 @@ describe('ThreadManager.setResolved', () => {
   })
 })
 
+describe('ThreadManager.markNumber', () => {
+  it('marks a thread solved or archived by its number, and refuses an unknown one', async () => {
+    const t = setup()
+    await t.manager.open('main', { title: 'a', task: 'x', initiation: 'user_asked' })
+    await t.manager.onIdle('session-1')
+    expect((await t.manager.markNumber('main', 1, 'resolve')).resolved).toBe(true)
+    expect(t.manager.describe('main')).toContain('· 已解决')
+    // Marking it solved again changes nothing (the record is not even written).
+    const marked = t.store.thread('session-1')!
+    expect((await t.manager.markNumber('main', 1, 'resolve')).updatedAt).toBe(marked.updatedAt)
+    expect((await t.manager.markNumber('main', 1, 'reopen')).resolved).toBe(false)
+    await expect(t.manager.markNumber('main', 9, 'resolve')).rejects.toThrow('没有讨论串 #9')
+    await expect(t.manager.markNumber('main', 9, 'archive')).rejects.toBeInstanceOf(ThreadError)
+    expect((await t.manager.markNumber('main', 1, 'archive')).archived).toBe(true)
+    expect(t.archived.has('session-1')).toBe(true)
+    // Archiving it again changes nothing either.
+    expect((await t.manager.markNumber('main', 1, 'archive')).updatedAt).toBe(t.store.thread('session-1')!.updatedAt)
+    expect(t.manager.describe('main')).toContain('· 已归档')
+    expect((await t.manager.markNumber('main', 1, 'unarchive')).archived).toBe(false)
+    expect(t.archived.has('session-1')).toBe(false)
+  })
+
+  it('refuses to archive a thread that is still running', async () => {
+    const t = setup()
+    await t.manager.open('main', { title: 'a', task: 'x', initiation: 'user_asked' })
+    await expect(t.manager.markNumber('main', 1, 'archive')).rejects.toThrow('先停止再归档')
+    expect(t.archived.has('session-1')).toBe(false)
+    expect(t.store.thread('session-1')?.archived).toBe(false)
+  })
+
+  it('only marks threads of the calling main conversation', async () => {
+    const t = setup()
+    t.agents.set('other', new FakeAgent('other'))
+    await t.store.putProject({
+      id: 'project-2', title: 'Q', workspaceId: 'ws2', folder: '/tmp/q', mainSessionId: 'other',
+      pinned: false, instructions: '', icon: 'folder', goal: '', archived: false, notify: 'attention',
+      mainModel: null, threadModel: null, createdAt: '', updatedAt: '',
+    })
+    await t.manager.open('other', { title: 'a', task: 'x', initiation: 'user_asked' })
+    // #1 belongs to the other project's main conversation, not to this one.
+    await expect(t.manager.markNumber('main', 1, 'resolve')).rejects.toThrow('没有讨论串 #1')
+    expect((await t.manager.markNumber('other', 1, 'resolve')).resolved).toBe(true)
+  })
+})
+
 describe('thread model', () => {
   it("opens threads on the project's thread model, and on the default when DSH cannot use it", async () => {
     const t = setup()

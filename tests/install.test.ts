@@ -75,7 +75,7 @@ const text = (section: { text: string | (() => string) }) => typeof section.text
 describe('installPerAgent', () => {
   it('gives a project\'s main conversation the dispatcher tools and prompt, and plain sessions nothing', () => {
     const h = harness()
-    expect(h.main.tools).toEqual(['thread_open', 'thread_propose', 'thread_reply', 'thread_status'])
+    expect(h.main.tools).toEqual(['thread_open', 'thread_propose', 'thread_reply', 'thread_status', 'thread_mark'])
     expect(h.main.sections.map((s) => s.name)).toEqual(['dsh-threads-project', 'dsh-threads'])
     expect(text(h.main.sections[0]!)).toContain('# Project: P')
     expect(text(h.main.sections[1]!)).toContain('# Threads (dsh-threads)')
@@ -115,7 +115,7 @@ describe('installPerAgent', () => {
     await h.t.manager.onIdle('session-1')
 
     await h.projects.remove('project-1')
-    expect(h.main.disposed.sort()).toEqual(['dsh-threads', 'dsh-threads-lead', 'dsh-threads-project', 'thread_open', 'thread_propose', 'thread_reply', 'thread_status'])
+    expect(h.main.disposed.sort()).toEqual(['dsh-threads', 'dsh-threads-lead', 'dsh-threads-project', 'thread_mark', 'thread_open', 'thread_propose', 'thread_reply', 'thread_status'])
     expect(thread.disposed.sort()).toEqual(['dsh-threads', 'dsh-threads-project', 'dsh-threads-stopped', 'thread_report'])
 
     // Making the old main conversation a project again: the main conversation and its thread get their tools back.
@@ -127,9 +127,9 @@ describe('installPerAgent', () => {
   it('cleans up when a session goes away and when the plugin unloads', () => {
     const h = harness()
     h.dispose('main')
-    expect(h.main.disposed).toHaveLength(7)
+    expect(h.main.disposed).toHaveLength(8)
     const other = harness()
     other.unload()
-    expect(other.main.disposed).toHaveLength(7)
+    expect(other.main.disposed).toHaveLength(8)
   })
 })

@@ -12,6 +12,7 @@ import type { Projects } from './projects.ts'
 import { dispatcherPrompt, LEAD_CONTEXT_ORDER, leadReminder, projectPrompt, SECTION_ORDER, STOPPED_CONTEXT_ORDER, stoppedReminder, threadPrompt } from './prompts.ts'
 import { type Role, roleOf } from './roles.ts'
 import { threadOpenTool } from './tools/thread-open.ts'
+import { threadMarkTool } from './tools/thread-mark.ts'
 import { threadProposeTool } from './tools/thread-propose.ts'
 import { threadReplyTool } from './tools/thread-reply.ts'
 import { threadReportTool } from './tools/thread-report.ts'
@@ -57,6 +58,7 @@ export function installPerAgent(ctx: Context, manager: ThreadManager, projects: 
         disposers.push(scope.tools.register(threadProposeTool(manager, config.maxProposalsPerTurn)))
         disposers.push(scope.tools.register(threadReplyTool(manager)))
         disposers.push(scope.tools.register(threadStatusTool(manager)))
+        disposers.push(scope.tools.register(threadMarkTool(manager)))
         disposers.push(scope.systemPrompt.section({ name: SECTION_NAME, order: SECTION_ORDER, text: dispatcherPrompt(config.maxRunning, config.offerApproval) }))
         disposers.push(scope.systemPrompt.context({ name: LEAD_CONTEXT_NAME, order: LEAD_CONTEXT_ORDER, text: () => leadReminder(manager.inboxCount(agent.id)) }))
       }

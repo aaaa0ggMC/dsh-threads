@@ -3,6 +3,7 @@ import { ToolArgsError } from '@deepseek-ai/dsh-tools'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 import { beforeEach, describe, expect, it } from 'vitest'
 import { Config } from '../src/config.ts'
+import { threadMarkTool } from '../src/tools/thread-mark.ts'
 import { threadOpenTool } from '../src/tools/thread-open.ts'
 import { threadProposeTool } from '../src/tools/thread-propose.ts'
 import { threadReplyTool } from '../src/tools/thread-reply.ts'
@@ -164,6 +165,36 @@ describe('thread_status', () => {
     expect(await call(tool, {})).toContain('#1「查依赖」· running')
     expect(await call(tool, { n: 1 })).toContain('任务：列出过期依赖')
     expect(await call(tool, { n: 2 })).toBe('没有讨论串 #2。')
+  })
+})
+
+describe('thread_mark', () => {
+  it('marks a thread solved, reopens it, archives it and unarchives it, by its number', async () => {
+    const t = setup()
+    await t.manager.open('main', { title: '查依赖', task: '列出过期依赖', initiation: 'user_asked' })
+    await t.manager.onIdle('session-1')
+    const tool = threadMarkTool(t.manager)
+    expect(await call(tool, { n: 1, action: 'resolve' })).toContain('已把讨论串 #1「查依赖」标记为已解决')
+    expect(t.store.thread('session-1')).toMatchObject({ resolved: true, archived: false })
+    expect(await call(tool, { n: 1, action: 'resolve' })).toContain('标记为已解决')
+    expect(await call(tool, { n: 1, action: 'reopen' })).toContain('已重新打开讨论串 #1')
+    expect(t.store.thread('session-1')?.resolved).toBe(false)
+    expect(await call(tool, { n: 1, action: 'archive' })).toContain('已归档讨论串 #1')
+    expect(t.archived.has('session-1')).toBe(true)
+    expect(await call(tool, { n: 1, action: 'unarchive' })).toContain('已取消归档讨论串 #1')
+    expect(t.archived.has('session-1')).toBe(false)
+    await expect(call(tool, { n: 1, action: 'delete' })).rejects.toBeInstanceOf(ToolArgsError)
+    await expect(call(tool, { n: 1 })).rejects.toBeInstanceOf(ToolArgsError)
+  })
+
+  it('returns refusals as text the model can act on', async () => {
+    const t = setup()
+    await t.manager.open('main', { title: 'a', task: 'x', initiation: 'user_asked' })
+    const tool = threadMarkTool(t.manager)
+    // Running: the model is told to stop it first (the user does that in the pane).
+    expect(await call(tool, { n: 1, action: 'archive' })).toContain('没有标记：讨论串 #1 还在运行，先停止再归档')
+    expect(t.archived.has('session-1')).toBe(false)
+    expect(await call(tool, { n: 7, action: 'resolve' })).toContain('没有标记：这个主对话没有讨论串 #7')
   })
 })
 

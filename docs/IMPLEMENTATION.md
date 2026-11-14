@@ -201,6 +201,7 @@ docs/Plan.md 定了方向：在 DeepSeek Harness（DSH）里做一个插件—�
   - 超过并发上限时直接报错，告诉模型等某个讨论串结束。
 - `thread_status { n? }`：列出本主会话的讨论串和提议，或返回一个讨论串的最新回报。
 - `thread_reply { n, message, mode? }`：给讨论串追加指令。`mode: 'steer'`（默认）直接插进它正在做的事：运行中的讨论串在下一步就读到，不用等这一轮结束；`mode: 'followup'` 则排成它自己的下一轮，当前这一轮结束后才开始。空闲的讨论串两种都立刻开一轮。
+- `thread_mark { n, action: 'resolve' | 'reopen' | 'archive' | 'unarchive' }`：按 #n 标记已解决 / 重新打开、归档 / 取消归档（原来只有用户能在浏览器面板里做）。`resolve` 只改记录状态（不碰会话、不发通知，用户在它里面发消息会重新打开）；`archive` / `unarchive` 走 `setArchived`，在 DSH 里归档 / 取消归档会话。运行中归档被拒绝，要求先停止；重复标记幂等。
 
 **讨论串的工具**
 - `thread_report { status: 'done' | 'blocked' | 'needs_decision' | 'failed', summary (≤300 字), changedFiles?, decisions? }`
@@ -1026,6 +1027,19 @@ DSH 的两种投递（核对的是 `@deepseek-ai/dsh-agent` 的类型声明和 `
 - 工具描述、`src/prompts.ts` 的“Follow-ups: thread_reply”都写明什么时候用哪个；工具结果分开成“已把追加指令直接插给讨论串”和“已把追加指令排给讨论串……作为下一轮处理”，让模型知道自己刚才选的是哪种。
 - 测试：`FakeAgent` 增加 `steers`；`ThreadManager.reply` 覆盖默认 steer 和显式 followup；`thread_reply` 覆盖默认、显式 followup、拒绝未知 mode。
 - 实机验证（待做）：在用的 DSH 里发 `thread_reply`，正在运行的讨论串应在一两步内读到（不再出现在排队消息一行），并照常回报。
+
+#### 主对话标记已解决 / 归档：thread_mark（2026-11-06）
+
+用户报的问题：「标记已解决」和「归档」只有用户能在浏览器讨论串面板里点（`threads.resolve` / `reopen` / `archive` / `unarchive`，见 `src/api.ts`），主对话想让列表干净一点、或想把做完的讨论串收起来时没有工具可用。
+
+改动：
+- 新工具 `src/tools/thread-mark.ts`：`thread_mark { n, action }`，`action` 取 `resolve | reopen | archive | unarchive`，按 #n 找讨论串（和 `thread_reply` 一样，不用 session id）。只注册给 dispatcher（`src/install.ts`），讨论串会话里没有它。
+- `ThreadManager.markNumber(mainSessionId, n, action)`（`src/manager.ts`）：照 `stopNumber` 的写法按 n 找线程，找不到抛 `ThreadError(msg().noThreadNumber(n))`，然后转调已有的 `setResolved` / `setArchived`。`resolve` 只改记录状态，不碰会话、不发通知；`archive` / `unarchive` 会归档 / 取消归档 DSH 会话。运行中归档沿用 `stopBeforeArchive` 拒绝（「先停止再归档」）。两个方法都带幂等短路，重复标记不会重复写存储、也不会重复调宿主。
+- 工具结果文案中英双语（`src/messages.ts`）：`toolResolved` / `toolReopened` / `toolArchived` / `toolUnarchived` / `toolNotMarked`，失败时给出拒绝的原因（例如「讨论串 #n 还在运行，先停止再归档」「这个主对话没有讨论串 #n」）。
+- `thread_status`（`manager.describe`）在状态后面补一个 `resolvedMark`（「 · 已解决」/「 · resolved」），和原来的 `archivedMark` 并列；`describeHead` / `listLine` 的第四个参数改成合并后的 marks。
+- `src/prompts.ts` 的 dispatcherPrompt 加一节「Marking threads solved, and archiving them」：任务做完且用户看过之后再 `resolve`（不要用它结束一轮、也不要在活没做完时标）；不再需要的线程用 `archive`（移出列表、DSH 会话归档、不删除，运行中会被拒绝）；这些用户都能在面板里做，主对话只在需要整理列表时做，并告诉用户。
+- 测试：`tests/manager.test.ts` 的 `ThreadManager.markNumber`（按 n 解析、四种 action、重复标记幂等不写存储、运行中归档被拒、只标记本主对话的线程）；`tests/tools.test.ts` 的 `thread_mark`（成功文案、未知 n 和未知 action、运行中归档的拒绝文案）；`tests/install.test.ts` 的 dispatcher 工具清单加上 `thread_mark`。
+- 实机验证（待做）：在桌面版里让主对话对做完的讨论串调 `thread_mark`，检查列表、标题栏计数、输入框锁定和 `thread_status` 的显示。
 
 ## 六、验证
 

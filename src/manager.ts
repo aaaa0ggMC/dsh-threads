@@ -89,6 +89,9 @@ export class ThreadError extends Error {}
 /** How thread_reply puts its message into the thread: into the current work, or as its next turn. */
 export type ReplyMode = 'steer' | 'followup'
 
+/** How thread_mark changes a thread: mark it solved, undo that, or (un)archive it. */
+export type MarkAction = 'resolve' | 'reopen' | 'archive' | 'unarchive'
+
 const TITLE_MAX = 30
 
 export function titleFrom(task: string): string {
@@ -534,6 +537,18 @@ export class ThreadManager {
   }
 
   /**
+   * thread_mark from a main conversation: mark a thread solved or archived by its number, the way
+   * `/thread stop <n>` finds it. Both are idempotent, and archiving is refused while it runs.
+   */
+  markNumber(mainSessionId: string, n: number, action: MarkAction): Promise<ThreadRecord> {
+    const thread = this.deps.store.threadsOf(mainSessionId).find((t) => t.n === n)
+    if (thread === undefined) return Promise.reject(new ThreadError(msg().noThreadNumber(n)))
+    return action === 'archive' || action === 'unarchive'
+      ? this.setArchived(thread.id, action === 'archive')
+      : this.setResolved(thread.id, action === 'resolve')
+  }
+
+  /**
    * Archive one thread, as in Claude: its session is archived in DSH (out of the way, nothing
    * deleted) and it leaves the threads list. Refused while it runs; stop it first.
    */
@@ -683,7 +698,7 @@ export class ThreadManager {
   /** Text for thread_status: every thread of this main conversation, or one thread in detail. */
   describe(mainSessionId: string, n?: number): string {
     const m = msg()
-    const marks = (thread: ThreadRecord) => `${this.isStopped(thread.id) ? m.stoppedMark : ''}${thread.archived ? m.archivedMark : ''}`
+    const marks = (thread: ThreadRecord) => `${this.isStopped(thread.id) ? m.stoppedMark : ''}${thread.resolved ? m.resolvedMark : ''}${thread.archived ? m.archivedMark : ''}`
     const threads = this.deps.store.threadsOf(mainSessionId)
     if (n !== undefined) {
       const thread = threads.find((t) => t.n === n)
