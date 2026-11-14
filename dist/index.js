@@ -49,12 +49,17 @@ const zh = {
 	cleanupFailed: (n, reason) => `#${n}：删除失败（${reason}）`,
 	cleanupDirty: (n, path) => `#${n}：${path} 里有没提交的改动，没删；先提交或丢弃。`,
 	cleanupRemoved: (n, branch, kept) => `#${n}：已删除 worktree，${kept ? `分支 ${branch} 还有没合并的提交，保留` : `分支 ${branch} 已合并，一并删除`}。`,
+	staleThreadModel: (model, fallback) => fallback === null ? `项目里存的讨论串模型 ${model} 已不在 DSH 的模型目录里，已清空；目录里也没有可用模型，这个讨论串先按默认开。` : `项目里存的讨论串模型 ${model} 已不在 DSH 的模型目录里，已清空；这个讨论串改用 ${fallback}。`,
+	staleInheritedModel: (model, fallback) => fallback === null ? `这个讨论串默认会用 ${model}，但它已不在 DSH 的模型目录里；目录里也没有可用模型，先按默认开。` : `这个讨论串默认会用 ${model}，但它已不在 DSH 的模型目录里，已改用 ${fallback}。`,
+	modelCheckFailed: (reason) => `没法对照 DSH 的模型目录校验讨论串的模型（${reason}）：按现状开讨论串。`,
 	noSuchThread: (n) => `没有讨论串 #${n}。`,
 	noThreads: "这个主对话还没有讨论串。",
 	archivedMark: " · 已归档",
 	stoppedMark: " · 用户已停止",
 	resolvedMark: " · 已解决",
 	describeHead: (n, title, status, marks, id) => `讨论串 #${n}「${title}」· ${status}${marks}（会话 ${id}）`,
+	describeModel: (model) => `模型：${model}`,
+	describeModelUnknown: "模型：未知/默认",
 	describeWorktree: (path, branch, removed) => `worktree：${path}，分支 ${branch}${removed ? "（已删除 worktree）" : ""}`,
 	describeTask: (task) => `任务：${task}`,
 	describeNoReport: "最新回报：无",
@@ -175,12 +180,17 @@ const en = {
 	cleanupFailed: (n, reason) => `#${n}: removal failed (${reason})`,
 	cleanupDirty: (n, path) => `#${n}: ${path} has uncommitted changes, so it was kept; commit or discard them first.`,
 	cleanupRemoved: (n, branch, kept) => `#${n}: worktree removed; ${kept ? `branch ${branch} has unmerged commits and was kept` : `branch ${branch} was merged and was deleted too`}.`,
+	staleThreadModel: (model, fallback) => fallback === null ? `The project's thread model ${model} is no longer in DSH's model catalog, so it was cleared; the catalog has no usable model either, so this thread opens on the default.` : `The project's thread model ${model} is no longer in DSH's model catalog, so it was cleared; this thread uses ${fallback} instead.`,
+	staleInheritedModel: (model, fallback) => fallback === null ? `This thread would have used ${model} by default, but it is no longer in DSH's model catalog, and the catalog has no usable model either, so it opens on the default.` : `This thread would have used ${model} by default, but it is no longer in DSH's model catalog, so it uses ${fallback} instead.`,
+	modelCheckFailed: (reason) => `The thread's model could not be checked against DSH's model catalog (${reason}); the thread opens as before.`,
 	noSuchThread: (n) => `No thread #${n}.`,
 	noThreads: "This main conversation has no threads yet.",
 	archivedMark: " · archived",
 	stoppedMark: " · stopped by the user",
 	resolvedMark: " · resolved",
 	describeHead: (n, title, status, marks, id) => `Thread #${n} "${title}" · ${status}${marks} (session ${id})`,
+	describeModel: (model) => `Model: ${model}`,
+	describeModelUnknown: "Model: unknown/default",
 	describeWorktree: (path, branch, removed) => `Worktree: ${path}, branch ${branch}${removed ? " (worktree removed)" : ""}`,
 	describeTask: (task) => `Task: ${task}`,
 	describeNoReport: "Latest report: none",
@@ -1077,6 +1087,35 @@ function cardOf(thread) {
 		branch: thread.worktree.branch
 	};
 }
+/** Whether DSH's catalog still offers exactly this model. */
+function catalogHas(catalog, choice) {
+	return catalog.groups.some((group) => group.id === choice.provider && group.models.some((model) => model.id === choice.model));
+}
+/**
+* What a thread falls back to when its model is gone: the deployment default while the catalog
+* still offers it, otherwise the first model it does. Null when the catalog offers none at all.
+*/
+function catalogFallback(catalog) {
+	const { provider, model, reasoningEffort } = catalog.default;
+	if (catalogHas(catalog, catalog.default)) return reasoningEffort === void 0 ? {
+		provider,
+		model
+	} : {
+		provider,
+		model,
+		reasoningEffort
+	};
+	const group = catalog.groups.find((candidate) => candidate.models.length > 0);
+	const first = group?.models[0];
+	return group === void 0 || first === void 0 ? null : {
+		provider: group.id,
+		model: first.id
+	};
+}
+/** `provider/model`, as messages and thread_status name a model. */
+function modelRef(choice) {
+	return `${choice.provider}/${choice.model}`;
+}
 /** A refusal the model should read and act on (not a bug). */
 var ThreadError = class extends Error {};
 const TITLE_MAX = 30;
@@ -1223,8 +1262,8 @@ var ThreadManager = class {
 			await store.putThread(record);
 			const agent = await host.createSession(mainSessionId, id);
 			if (worktree !== null) await host.enterDirectory(id, worktreeFolder(worktree));
-			const threadModel = store.projectOfMain(mainSessionId)?.threadModel ?? null;
-			if (threadModel !== null) await host.applyModel(id, threadModel).catch((error) => {
+			const choice = await this.threadModelFor(id, mainSessionId);
+			if (choice !== null) await host.applyModel(id, choice).catch((error) => {
 				this.deps.warn(`dsh-threads: thread ${id} keeps the default model: ${String(error)}`);
 			});
 			try {
@@ -1247,6 +1286,44 @@ var ThreadManager = class {
 		} finally {
 			this.creating.delete(id);
 		}
+	}
+	/**
+	* The model to give a thread that is opening: the project's stored choice while DSH's catalog
+	* still offers it, otherwise the catalog's default (or first) model — and the stored choice
+	* forgotten when it is gone. DSH seeds a new session with its deployment default without
+	* checking the catalog, so a model deleted in the settings would otherwise keep the thread
+	* running, and billing, until the provider refuses it.
+	*
+	* Reading the catalog or the session's own record is best-effort: when either fails this
+	* returns the stored choice (null when there is none), which is the thread's behaviour
+	* without any validation — a check must never keep a thread from opening.
+	*/
+	async threadModelFor(threadId, mainSessionId) {
+		const { store, host } = this.deps;
+		const project = store.projectOfMain(mainSessionId);
+		const stored = project?.threadModel ?? null;
+		let catalog;
+		let effective;
+		try {
+			catalog = await host.modelCatalog();
+			effective = stored ?? await host.effectiveModel(threadId) ?? catalog.default;
+		} catch (error) {
+			this.deps.warn(msg().modelCheckFailed(error instanceof Error ? error.message : String(error)));
+			return stored;
+		}
+		if (catalogHas(catalog, effective)) return stored;
+		const fallback = catalogFallback(catalog);
+		const gone = modelRef(effective);
+		const target = fallback === null ? null : modelRef(fallback);
+		if (project !== void 0 && stored !== null) {
+			await store.putProject({
+				...project,
+				threadModel: null,
+				updatedAt: this.deps.now()
+			});
+			this.deps.warn(msg().staleThreadModel(gone, target));
+		} else this.deps.warn(msg().staleInheritedModel(gone, target));
+		return fallback;
 	}
 	/** Start a round the main conversation asked for. The record is saved before the message is sent. */
 	async dispatch(record, agent, text) {
@@ -1774,7 +1851,7 @@ var ThreadManager = class {
 		return lines;
 	}
 	/** Text for thread_status: every thread of this main conversation, or one thread in detail. */
-	describe(mainSessionId, n) {
+	async describe(mainSessionId, n) {
 		const m = msg();
 		const marks = (thread) => `${this.isStopped(thread.id) ? m.stoppedMark : ""}${thread.resolved ? m.resolvedMark : ""}${thread.archived ? m.archivedMark : ""}`;
 		const threads = this.deps.store.threadsOf(mainSessionId);
@@ -1784,6 +1861,7 @@ var ThreadManager = class {
 			const report = thread.lastReport;
 			return [
 				m.describeHead(thread.n, thread.title, thread.status, marks(thread), thread.id),
+				await this.modelLine(thread.id),
 				thread.worktree === null ? "" : m.describeWorktree(thread.worktree.path, thread.worktree.branch, thread.worktree.removed),
 				m.describeTask(truncate(thread.task, 600)),
 				report === null ? m.describeNoReport : [
@@ -1799,6 +1877,19 @@ var ThreadManager = class {
 			const latest = t.lastReport === null ? m.listNoReport : m.listLatest(t.lastReport.status, truncate(t.lastReport.summary, 80));
 			return m.listLine(t.n, t.title, t.status, marks(t), latest);
 		}).join("\n");
+	}
+	/**
+	* The thread's current model for thread_status: what its requests use, as DSH recorded it.
+	* A thread that has not made a request yet follows DSH's default, and a session whose record
+	* cannot be read says so — neither is worth failing the whole description over.
+	*/
+	async modelLine(sessionId) {
+		try {
+			const model = await this.deps.host.effectiveModel(sessionId);
+			return model === null ? msg().describeModelUnknown : msg().describeModel(modelRef(model));
+		} catch {
+			return msg().describeModelUnknown;
+		}
 	}
 };
 // src/command.ts
@@ -2006,6 +2097,12 @@ function createHost(ctx) {
 		},
 		async sessionUsage(sessionId) {
 			return (await ctx.sessionController.projections({ sessionId }, AbortSignal.timeout(5e3)))?.values?.tokenUsage ?? null;
+		},
+		modelCatalog() {
+			return ctx.sessionController.modelCatalog();
+		},
+		async effectiveModel(sessionId) {
+			return ((await ctx.sessionController.projections({ sessionId }, AbortSignal.timeout(5e3)))?.values?.modelSelection)?.lastUsed ?? null;
 		},
 		async archiveSession(sessionId) {
 			await ctx.workspaceRegistry.archiveSession(sessionId, { stopActivity: false });
@@ -2564,7 +2661,7 @@ function threadStatusTool(manager) {
 			const caller = exec.agent;
 			if (caller === void 0) throw new Error("thread_status needs a calling session");
 			try {
-				return manager.describe(caller.id, args.n);
+				return await manager.describe(caller.id, args.n);
 			} catch (error) {
 				if (error instanceof ThreadError) return error.message;
 				throw error;
