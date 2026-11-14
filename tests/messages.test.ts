@@ -43,6 +43,18 @@ describe('host language', () => {
     ].join('\n'))
   })
 
+  it('writes a failed round in English', () => {
+    setLanguage('en')
+    const note = composeNote({ id: 'session-1', n: 3, title: 'Deps' }, null, undefined, 400,
+      { failure: { message: 'Your account quota has run out', code: 'QUOTA', status: 403 } })
+    expect(note).toBe([
+      '[Thread #3 "Deps" · failed · the thread\'s own report, not proof]',
+      'Failed: Your account quota has run out (code QUOTA, HTTP 403). The thread\'s model call failed this round — the report was not lost; '
+        + 'tell the user the reason and let them decide whether to retry.',
+      'Details: thread_status { n: 3 }, or have the user open the thread in the sidebar.',
+    ].join('\n'))
+  })
+
   it('asks the offer question in the page language and accepts an answer in either', async () => {
     setLanguage('en')
     const t = setup()

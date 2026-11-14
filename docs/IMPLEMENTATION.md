@@ -191,6 +191,7 @@ docs/Plan.md 定了方向：在 DeepSeek Harness（DSH）里做一个插件—�
   - `mainSessionId`、`n`（同一主会话里的序号）、`title`、`task`、`initiation`
   - `status`：`starting | running | idle | failed | archived`
   - `lastReport`：`{ status, summary, changedFiles, decisions, at }`
+  - `error`：这一轮为什么失败（`failed` 时有值），`thread_status` 的详情里显示成「错误：…」
   - `startSeq`、`createdAt`、`updatedAt`
 - `proposals`（键是 uuid）：`mainSessionId`、`title`、`task`、`createdAt`、`expiresAt`、`state`。
 - `mains`（键是主会话 sessionId）：`autoWakeStreak`、`pendingNotes[]`。
@@ -213,6 +214,13 @@ docs/Plan.md 定了方向：在 DeepSeek Harness（DSH）里做一个插件—�
   - 先取本轮的 `thread_report`；
   - 没有就用 `finalAssistantOutput` 兜底，并标注"未提交回报"；
   - 拼成便条，截断到 `noteMaxChars`，放进该主会话的 `pendingNotes`。
+- **这一轮失败了怎么办**（`turn/end` 的 `reason.kind === 'error'`，带 `LlmFailure`）
+  - 先读本轮最后一次 `turn/end`：`reason.kind === 'error'` 时取出 `{ message, code, status? }`（`message` 截到 200 字），否则当作没有失败。只认 `error`：`interrupted`（崩溃后补的收尾）、`aborted`、`max-tokens` 都不算失败，免得把"用户停下"和"到 token 上限"伪装成故障。
+  - 有失败：线程 `status` 置 `failed`、`error` 记 `<message>（code <code>[，HTTP <status>]）`；便条在标题下一行写「失败：<原因>。这一轮的模型调用失败了，不是回报丢了；把原因如实告诉用户，由用户决定是否重开。」，位置在截断丢不掉的地方。没有回报又没有回复时不再写「没有回报也没有回复」——那句话正是主对话把故障当成插件出问题的原因。
+  - 投递：`dispatch` 轮失败照常 loud（主对话必须知道，仍受 `maxAutoWakes` / `decideDelivery` 约束），`user` 轮失败保持 quiet（用户自己在讨论串里看到报错了）。
+  - 已经发过回报的这一轮又失败（极端情况）：仍然补一条简短的失败便条，失败信息比去重更重要。
+  - 失败的那一轮不再发"补一次 thread_report"的提醒：那会再开一个回合、再失败一次，主对话反而更晚知道原因。
+  - 用户停下的（`stoppedByUser`）不算失败，便条照旧写 stopped。
 - 便条格式：
 
   ```
@@ -222,6 +230,8 @@ docs/Plan.md 定了方向：在 DeepSeek Harness（DSH）里做一个插件—�
   待你决定：…
   （这是讨论串的报告，不是证据）
   ```
+
+  这一轮失败时，第二行是「失败：<原因>（code <code>）」，标题里的状态是 `failed`；卡片（`card.status`）同样是 `failed`，侧栏、列表、面板头照常用那个红色叉。
 
 - 判断这一轮由谁发起：看本轮第一条用户消息的 `source.kind`。
   - 是 `dsh-threads`（主对话派的任务）：按下面的规则投递。
@@ -235,7 +245,7 @@ docs/Plan.md 定了方向：在 DeepSeek Harness（DSH）里做一个插件—�
 - 第 3 步，主会话正在运行：先不发。主会话变成 `idle` 时，再回到第 1 步判断。
 - 第 4 步，达到唤醒上限：改用 `inject`，只进上下文不唤醒；面板上标出"等待你回来"。
 - 计数清零：主会话收到真实用户消息时，`autoWakeStreak` 归零。
-- 去重：投递过的报告记在 `reportSentAt`，回合结束的 `settle` 不再重复发同一条便条。
+- 去重：投递过的报告记在 `reportSentAt`，回合结束的 `settle` 不再重复发同一条便条；例外是这一轮在报告之后又出现了主对话还没听说过的情况——失败了（失败信息比去重更重要）或被用户停掉了（那是用户的决定，决定什么能重开），两种都照旧补一条。
 
 **系统提示**
 - 给主会话（dispatcher），内容改写自第一节的 Claude 规则：

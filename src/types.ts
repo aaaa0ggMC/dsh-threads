@@ -24,6 +24,17 @@ export interface ThreadReport {
  */
 export type RoundOrigin = 'dispatch' | 'user'
 
+/**
+ * Why a thread's round failed, as DSH recorded it (`turn/end` with `reason.kind === 'error'`):
+ * the provider's words, its provider-neutral machine code (`QUOTA`, `RATE_LIMIT`, …) and the
+ * HTTP status when the provider gave one.
+ */
+export interface RoundFailure {
+  message: string
+  code: string
+  status?: number
+}
+
 /** A thread's own git checkout (M3b): it works and commits on its own branch. */
 export interface ThreadWorktree {
   /** The checkout's root. */

@@ -72,6 +72,9 @@ const zh = {
   changedFiles: (files: readonly string[]) => `改动：${files.join('、')}`,
   decisionsLine: (decisions: readonly string[]) => `待用户决定：${decisions.join('；')}`,
   noteFallback: (text: string) => `（讨论串没有调用 thread_report，以下是它最后一条回复）${text}`,
+  failureReason: (message: string, code: string, status?: number) =>
+    `${message}（code ${code}${status === undefined ? '' : `，HTTP ${status}`}）`,
+  noteFailure: (reason: string) => `失败：${reason}。这一轮的模型调用失败了，不是回报丢了；把原因如实告诉用户，由用户决定是否重开。`,
   noteNothing: '（讨论串结束了，但没有回报也没有回复；用户可以点开讨论串查看。）',
   noteDetails: (n: number) => `详情：thread_status { n: ${n} }，或让用户在侧栏打开该讨论串。`,
   reportsSummary: (count: number) => `${count} 个讨论串回报`,
@@ -213,6 +216,8 @@ const en: Messages = {
   changedFiles: (files) => `Changed: ${files.join(', ')}`,
   decisionsLine: (decisions) => `For the user to decide: ${decisions.join('; ')}`,
   noteFallback: (text) => `(The thread did not call thread_report; this is its last reply) ${text}`,
+  failureReason: (message, code, status) => `${message} (code ${code}${status === undefined ? '' : `, HTTP ${status}`})`,
+  noteFailure: (reason) => `Failed: ${reason}. The thread's model call failed this round — the report was not lost; tell the user the reason and let them decide whether to retry.`,
   noteNothing: '(The thread ended without a report or a reply; the user can open the thread to look.)',
   noteDetails: (n) => `Details: thread_status { n: ${n} }, or have the user open the thread in the sidebar.`,
   reportsSummary: (count) => `${count} thread reports`,

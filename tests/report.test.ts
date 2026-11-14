@@ -49,6 +49,23 @@ describe('composeNote', () => {
     expect(composeNote(thread, null, undefined, 400)).toContain('没有回报也没有回复')
   })
 
+  it('leads with the failure when the round\'s model call failed', () => {
+    const note = composeNote(thread, null, undefined, 400, { failure: { message: '账户额度已用完', code: 'QUOTA', status: 403 } })
+    expect(note).toContain('· failed ·')
+    expect(note.split('\n')[1]).toBe('失败：账户额度已用完（code QUOTA，HTTP 403）。这一轮的模型调用失败了，不是回报丢了；把原因如实告诉用户，由用户决定是否重开。')
+    expect(note).not.toContain('没有回报也没有回复')
+  })
+
+  it('keeps the failure above the cut, next to a report the thread already sent', () => {
+    const long = normalizeReport({ status: 'done', summary: '很长'.repeat(500) }, 2000, report.at)
+    const cut = composeNote(thread, long, undefined, 120, { failure: { message: '账户额度已用完', code: 'QUOTA' } })
+    expect(cut).toContain('失败：账户额度已用完（code QUOTA）')
+    expect([...cut].length).toBeLessThanOrEqual(120)
+    const both = composeNote(thread, report, undefined, 400, { failure: { message: '连接被重置', code: 'UNKNOWN' } })
+    expect(both).toContain('摘要：依赖已更新，测试通过。')
+    expect(both).toContain('失败：连接被重置（code UNKNOWN）')
+  })
+
   it('quotes the user when they asked for the change in the thread', () => {
     const report = normalizeReport({ status: 'done', summary: '困难起步改为 60ms' }, 300, 'now')
     const asked = composeNote({ ...thread, round: 'user', userMessages: ['困难模式再快一点，起始速度提到 60ms。'] }, report, undefined, 400)

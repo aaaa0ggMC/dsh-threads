@@ -5,7 +5,7 @@ import { msg } from './messages.ts'
 import { composeNote, currentReport, normalizeReport, noticeSummary, plainLine, truncate } from './report.ts'
 import type { NoticeMeta, ThreadCardInfo } from './source.ts'
 import type { ThreadStore } from './store.ts'
-import type { Initiation, ModelChoice, PendingNote, ProposalRecord, ThreadRecord, ThreadReport, ThreadWorktree } from './types.ts'
+import type { Initiation, ModelChoice, PendingNote, ProposalRecord, RoundFailure, ThreadRecord, ThreadReport, ThreadWorktree } from './types.ts'
 import { type RemoveResult, worktreeFolder } from './worktree.ts'
 
 /** Longest report summary carried on a transcript card. */
@@ -49,6 +49,12 @@ export interface ThreadHost {
   setPermission(threadId: string, preset: string): void
   /** Text of the thread's last assistant reply since `fromSeq`. */
   roundOutput(threadId: string, fromSeq: number): string | undefined
+  /**
+   * Why the thread's latest turn since `fromSeq` failed, when it did: the provider failure's
+   * message, its provider-neutral code and, when the provider gave one, its HTTP status. Null
+   * when the turn ended any other way (completed, stopped, blocked, out of tokens, …).
+   */
+  roundFailure(threadId: string, fromSeq: number): RoundFailure | null
   /** Whether the thread's latest turn since `fromSeq` ended because the user stopped it (DSH's stop button, or ours). */
   stoppedByUser(threadId: string, fromSeq: number): boolean
   /** Stop the thread's running turn, dropping input queued behind it; false when nothing was running. */
@@ -372,14 +378,18 @@ export class ThreadManager {
     }
     // The user stopped the round (DSH's stop button in the thread, or ours): never remind it back to work.
     const stopped = this.deps.host.stoppedByUser(thread.id, thread.roundStartSeq ?? 0)
+    // A round whose model call failed (quota, credentials, the provider down) is not waiting for a
+    // report: reminding it would start another turn — and another failed call — before the main
+    // conversation hears why this one produced nothing.
+    const failure = stopped ? null : this.deps.host.roundFailure(thread.id, thread.roundStartSeq ?? 0)
     // A task round that ended without thread_report: ask once, keep the round open.
-    if (!stopped && thread.round === 'dispatch' && thread.reminder === null && this.deps.config.reportReminder
+    if (!stopped && failure === null && thread.round === 'dispatch' && thread.reminder === null && this.deps.config.reportReminder
       && currentReport(thread) === null && await this.remind(thread)) return
     // Until the note is queued, delivery must not mistake this thread for finished-and-reported:
     // another thread settling at the same moment would otherwise wake the main conversation alone.
     this.settling.add(thread.id)
     try {
-      await this.settle(thread, stopped)
+      await this.settle(thread, stopped, failure)
     } finally {
       this.settling.delete(thread.id)
     }
@@ -400,22 +410,36 @@ export class ThreadManager {
   /**
    * Turn the finished round into a note for the main conversation. A round the user drove, or
    * stopped, is quiet: the user already knows, and the main conversation hears at its next turn.
+   * A round that failed is neither: the thread becomes `failed` and the main conversation is told
+   * why, or it reads the missing report as a bug in this plugin.
    */
-  private async settle(thread: ThreadRecord, stopped = false): Promise<void> {
+  private async settle(thread: ThreadRecord, stopped = false, failure: RoundFailure | null = null): Promise<void> {
     const report = currentReport(thread)
-    await this.deps.store.putThread({ ...thread, status: 'idle', round: null, userMessages: [], reminder: null, stopped, lastRound: thread.round, late: false, updatedAt: this.deps.now() })
+    const reason = failure === null ? null : msg().failureReason(failure.message, failure.code, failure.status)
+    await this.deps.store.putThread({
+      ...thread,
+      status: failure === null ? 'idle' : 'failed',
+      round: null,
+      userMessages: [],
+      reminder: null,
+      stopped,
+      lastRound: thread.round,
+      late: false,
+      ...(reason === null ? {} : { error: reason }),
+      updatedAt: this.deps.now(),
+    })
     // A report already handed over when it was recorded is not sent again at the round's end —
     // unless the round then ended in a way the main conversation has not been told about yet: the
     // user stopped it (that is the user's call, and it decides what may be reopened), or the
     // model call failed. Both override the de-duplication.
-    if (report !== null && thread.reportSentAt === report.at && !stopped) {
+    if (report !== null && thread.reportSentAt === report.at && !stopped && failure === null) {
       await this.drainQueue(thread.mainSessionId)
       return
     }
     const fallback = report !== null ? undefined
       : thread.reminder !== null ? thread.reminder.fallback ?? undefined
       : this.deps.host.roundOutput(thread.id, thread.roundStartSeq ?? 0)
-    await this.queueNote(thread, this.noteOf(thread, report, fallback, stopped, thread.late))
+    await this.queueNote(thread, this.noteOf(thread, report, fallback, { stopped, late: thread.late, failure }))
   }
 
   /**
@@ -613,20 +637,29 @@ export class ThreadManager {
     if (report === null || thread.reportSentAt === report.at) return
     const next: ThreadRecord = { ...thread, reportSentAt: report.at }
     await this.deps.store.putThread(next)
-    await this.queueNote(next, this.noteOf(next, report, undefined, false, false))
+    await this.queueNote(next, this.noteOf(next, report, undefined, {}))
     await this.flush(thread.mainSessionId)
   }
 
   /** The note a round's outcome becomes; `settle` and `deliverReport` share it. */
-  private noteOf(thread: ThreadRecord, report: ThreadReport | null, fallback: string | undefined, stopped: boolean, late: boolean): PendingNote {
+  private noteOf(
+    thread: ThreadRecord,
+    report: ThreadReport | null,
+    fallback: string | undefined,
+    outcome: { stopped?: boolean; late?: boolean; failure?: RoundFailure | null } = {},
+  ): PendingNote {
+    const stopped = outcome.stopped === true
+    const failure = outcome.failure ?? null
     return {
       threadId: thread.id,
-      text: composeNote(thread, report, fallback, this.deps.config.noteMaxChars, { stopped, late }),
+      text: composeNote(thread, report, fallback, this.deps.config.noteMaxChars, { stopped, late: outcome.late === true, failure }),
+      // A failed dispatch round is loud: the main conversation must know it got no result. A round
+      // the user drove stays quiet — they watched the error in the thread themselves.
       quiet: thread.round === 'user' || stopped,
       card: {
         ...cardOf(thread),
-        status: stopped ? 'stopped' : report?.status ?? 'no-report',
-        summary: truncate(plainLine(report?.summary ?? fallback ?? ''), CARD_SUMMARY_MAX),
+        status: stopped ? 'stopped' : failure !== null ? 'failed' : report?.status ?? 'no-report',
+        summary: truncate(plainLine(report?.summary ?? failure?.message ?? fallback ?? ''), CARD_SUMMARY_MAX),
         ...(report?.decisions[0] === undefined ? {} : { decision: truncate(report.decisions[0], CARD_SUMMARY_MAX) }),
         ...(report === null || report.changedFiles.length === 0 ? {} : { files: report.changedFiles.slice(0, CARD_FILES_MAX) }),
       },

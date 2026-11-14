@@ -1,5 +1,5 @@
 import { msg } from './messages.ts'
-import type { ThreadRecord, ThreadReport } from './types.ts'
+import type { RoundFailure, ThreadRecord, ThreadReport } from './types.ts'
 
 const ELLIPSIS = '…'
 /** Longest quote of one user message in a report. */
@@ -63,17 +63,22 @@ export function noticeSummary(thread: Pick<ThreadRecord, 'n' | 'title'>, status:
 /**
  * The note delivered to the main conversation: only the conclusion, changed files and
  * open decisions; the details stay in the thread (docs/IMPLEMENTATION.md §三).
+ *
+ * `failure` is why the round's model call failed. It leads the note, right under the header, so
+ * truncation cannot drop the one thing the main conversation must act on.
  */
 export function composeNote(
   thread: Pick<ThreadRecord, 'n' | 'title' | 'id'> & Partial<Pick<ThreadRecord, 'worktree' | 'round' | 'userMessages'>>,
   report: ThreadReport | null,
   fallbackText: string | undefined,
   maxChars: number,
-  options: { stopped?: boolean; late?: boolean } = {},
+  options: { stopped?: boolean; late?: boolean; failure?: RoundFailure | null } = {},
 ): string {
   const m = msg()
-  const status = options.stopped === true ? 'stopped' : report?.status ?? 'no-report'
+  const failure = options.failure ?? null
+  const status = options.stopped === true ? 'stopped' : failure !== null ? 'failed' : report?.status ?? 'no-report'
   const lines = [m.noteHeader(thread.n, thread.title, status)]
+  if (failure !== null) lines.push(m.noteFailure(m.failureReason(failure.message, failure.code, failure.status)))
   if (options.stopped === true) lines.push(m.noteStopped)
   // Also under the header: the main conversation has usually been told about this thread once already.
   if (options.late === true) lines.push(m.noteLate)
@@ -88,7 +93,7 @@ export function composeNote(
     if (report.decisions.length > 0) lines.push(m.decisionsLine(report.decisions))
   } else if (fallbackText !== undefined) {
     lines.push(m.noteFallback(fallbackText))
-  } else {
+  } else if (failure === null) {
     lines.push(m.noteNothing)
   }
   lines.push(m.noteDetails(thread.n))

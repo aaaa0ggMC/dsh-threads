@@ -2,6 +2,7 @@
 // 0.2.1-rc.2 in docs/IMPLEMENTATION.md §二 and the M0 spike table.
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { LlmFailure } from '@deepseek-ai/dsh-llm'
 import { boundContextSummary, createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import { finalAssistantOutput } from '@deepseek-ai/dsh-subagent'
@@ -9,10 +10,13 @@ import { randomUUID } from 'node:crypto'
 import type { ThreadAgent, ThreadHost } from './manager.ts'
 import type { ProjectHost, TokenBuckets, WorkspaceInfo } from './projects.ts'
 import { msg } from './messages.ts'
-import { textOf } from './report.ts'
+import { textOf, truncate } from './report.ts'
 import { optional } from './services.ts'
 import { type NoticeMeta, SOURCE_KIND } from './source.ts'
 import { createWorktree, removeWorktree, systemGit } from './worktree.ts'
+
+/** How much of a provider failure's message reaches the main conversation. */
+const FAILURE_MESSAGE_MAX = 200
 
 interface SessionTitleLike {
   rename(session: Agent['session'], title: string): unknown
@@ -228,6 +232,26 @@ export function createHost(ctx: Context): ThreadHost & ProjectHost & ReplyHost {
         return reason?.kind === 'aborted' && reason.reason?.kind === 'user'
       }
       return false
+    },
+
+    roundFailure(threadId, fromSeq) {
+      const agent = live(threadId)
+      if (agent === undefined) return null
+      const events = agent.session.snapshotEvents(fromSeq as Parameters<typeof agent.session.snapshotEvents>[0])
+      for (let i = events.length - 1; i >= 0; i -= 1) {
+        const event = events[i] as { type: string; data?: { reason?: { kind: string; error?: LlmFailure } } }
+        if (event.type !== 'turn/end') continue
+        const reason = event.data?.reason
+        if (reason?.kind !== 'error') return null
+        const failure = reason.error
+        if (failure === undefined) return null
+        return {
+          message: truncate(String(failure.message ?? ''), FAILURE_MESSAGE_MAX),
+          code: String(failure.code ?? 'UNKNOWN'),
+          ...(typeof failure.status === 'number' ? { status: failure.status } : {}),
+        }
+      }
+      return null
     },
 
     roundOutput(threadId, fromSeq) {

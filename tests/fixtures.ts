@@ -3,7 +3,7 @@ import { Config } from '../src/config.ts'
 import { type ThreadAgent, type ThreadHost, ThreadManager } from '../src/manager.ts'
 import type { NoticeMeta } from '../src/source.ts'
 import { memoryStore, type ThreadStore } from '../src/store.ts'
-import type { ThreadWorktree } from '../src/types.ts'
+import type { RoundFailure, ThreadWorktree } from '../src/types.ts'
 import { WorktreeError } from '../src/worktree.ts'
 
 export class FakeAgent implements ThreadAgent {
@@ -22,6 +22,8 @@ export class FakeAgent implements ThreadAgent {
 export function setup(overrides: Partial<Config> = {}, options: { slowWrites?: boolean; slowMain?: boolean } = {}) {
   const agents = new Map<string, FakeAgent>()
   const outputs = new Map<string, string>()
+  /** Threads whose latest turn failed: session id → the failure DSH recorded. */
+  const failures = new Map<string, RoundFailure>()
   const renamed: string[] = []
   const inherited: string[] = []
   let failCreate = false
@@ -52,6 +54,7 @@ export function setup(overrides: Partial<Config> = {}, options: { slowWrites?: b
     },
     setPermission(thread, preset) { inherited.push(`${preset}->${thread}`) },
     roundOutput(id) { return outputs.get(id) },
+    roundFailure(id) { return failures.get(id) ?? null },
     stoppedByUser: (id) => stopped.has(id),
     async cancel(id) {
       const agent = agents.get(id)
@@ -101,5 +104,5 @@ export function setup(overrides: Partial<Config> = {}, options: { slowWrites?: b
     pinned: false, instructions: '', icon: 'folder', goal: '', archived: false, notify: 'attention',
     mainModel: null, threadModel: null, createdAt: '', updatedAt: '',
   })
-  return { manager, store, main, agents, outputs, renamed, inherited, entered, removals, models, stopped, archived, failCreate: () => { failCreate = true }, notARepo: () => { notARepo = true }, unreachableMain: () => { unreachableMain = true }, subdir: (value: string) => { subdir = value } }
+  return { manager, store, main, agents, outputs, failures, renamed, inherited, entered, removals, models, stopped, archived, failCreate: () => { failCreate = true }, notARepo: () => { notARepo = true }, unreachableMain: () => { unreachableMain = true }, subdir: (value: string) => { subdir = value } }
 }

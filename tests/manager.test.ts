@@ -672,6 +672,87 @@ describe('report reminder', () => {
   })
 })
 
+describe('failed rounds', () => {
+  let t: ReturnType<typeof setup>
+  beforeEach(() => { t = setup() })
+
+  it('fails the thread and tells the main conversation why the round produced nothing', async () => {
+    await t.manager.open('main', { title: '查依赖', task: 'x', initiation: 'user_asked' })
+    t.failures.set('session-1', { message: '账户额度已用完', code: 'QUOTA', status: 403 })
+    await t.manager.onIdle('session-1')
+    expect(t.store.thread('session-1')).toMatchObject({ status: 'failed', round: null })
+    expect(t.store.thread('session-1')?.error).toBe('账户额度已用完（code QUOTA，HTTP 403）')
+    // Loud: a dispatched round that failed must reach the main conversation now, not at its next turn.
+    expect(t.main.followups).toHaveLength(1)
+    expect(t.main.injects).toHaveLength(0)
+    expect(t.store.main('main').autoWakeStreak).toBe(1)
+    expect(t.main.followups[0]).toContain('· failed ·')
+    expect(t.main.followups[0]).toContain('失败：账户额度已用完（code QUOTA，HTTP 403）')
+    expect(t.main.followups[0]).toContain('由用户决定是否重开')
+    expect(t.main.followups[0]).not.toContain('没有回报也没有回复')
+    expect(t.main.metas[0]?.threads[0]?.status).toBe('failed')
+    expect(t.main.metas[0]?.threads[0]?.summary).toContain('账户额度已用完')
+  })
+
+  it('does not ask a failed round to report: that would start another failing turn', async () => {
+    t = setup({ reportReminder: true })
+    await t.manager.open('main', { title: 'a', task: 'x', initiation: 'user_asked' })
+    t.failures.set('session-1', { message: '服务暂时不可用', code: 'UNAVAILABLE' })
+    await t.manager.onIdle('session-1')
+    expect(t.agents.get('session-1')?.followups).toHaveLength(1)
+    expect(t.store.thread('session-1')).toMatchObject({ status: 'failed' })
+  })
+
+  it('still reports the failure when the round failed after its report was already sent', async () => {
+    await t.manager.open('main', { title: 'a', task: 'x', initiation: 'user_asked' })
+    await t.manager.recordReport('session-1', { status: 'done', summary: '先做到这里', changedFiles: [], decisions: [] })
+    expect(t.main.followups).toHaveLength(1)
+    t.failures.set('session-1', { message: '连接被重置', code: 'UNKNOWN' })
+    await t.manager.onIdle('session-1')
+    expect(t.main.followups).toHaveLength(2)
+    expect(t.main.followups[1]).toContain('失败：连接被重置（code UNKNOWN）')
+    expect(t.store.thread('session-1')).toMatchObject({ status: 'failed' })
+  })
+
+  it('reports a failed round the user drove in the thread quietly', async () => {
+    await t.manager.open('main', { title: 'a', task: 'x', initiation: 'user_asked' })
+    await t.manager.onIdle('session-1')
+    await t.manager.onInbox('session-1', 'user', 10, '再试一次')
+    const wakes = t.main.followups.length
+    t.failures.set('session-1', { message: '账户额度已用完', code: 'QUOTA' })
+    await t.manager.onIdle('session-1')
+    // The user watched the error in the thread themselves; the main conversation hears at its next turn.
+    expect(t.main.followups).toHaveLength(wakes)
+    expect(t.main.injects).toHaveLength(1)
+    expect(t.main.injects[0]).toContain('失败：账户额度已用完（code QUOTA）')
+    expect(t.store.thread('session-1')).toMatchObject({ status: 'failed' })
+  })
+
+  it('does not call a round the user stopped a failure', async () => {
+    t = setup({ reportReminder: true })
+    await t.manager.open('main', { title: 'a', task: 'x', initiation: 'user_asked' })
+    const thread = t.agents.get('session-1')!
+    thread.status = 'running'
+    await t.manager.stop('session-1')
+    // A failure left over from an earlier turn must not outrank the user's stop.
+    t.failures.set('session-1', { message: '账户额度已用完', code: 'QUOTA' })
+    await t.manager.onIdle('session-1')
+    expect(t.store.thread('session-1')).toMatchObject({ status: 'idle', round: null, error: null })
+    expect(t.main.injects[0]).toContain('· stopped ·')
+    expect(t.main.injects[0]).not.toContain('失败：')
+  })
+
+  it('settles a round that failed before DSH restarted', async () => {
+    await t.manager.open('main', { title: 'a', task: 'x', initiation: 'user_asked' })
+    t.failures.set('session-1', { message: '账户额度已用完', code: 'QUOTA' })
+    // The plugin reloaded: the record still says running while the thread's turn already ended.
+    await t.manager.recover()
+    expect(t.store.thread('session-1')).toMatchObject({ status: 'failed' })
+    expect(t.store.thread('session-1')?.error).toContain('QUOTA')
+    expect(t.main.followups.join('\n')).toContain('失败：账户额度已用完（code QUOTA）')
+  })
+})
+
 describe('parallel threads', () => {
   it('runs up to three threads at once by default', async () => {
     const t = setup()
