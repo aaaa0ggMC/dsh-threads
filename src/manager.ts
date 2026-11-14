@@ -69,6 +69,47 @@ export interface ThreadHost {
   removeWorktree(worktree: ThreadWorktree): Promise<RemoveResult>
   /** Give a session a model without changing DSH's default for new sessions. */
   applyModel(sessionId: string, choice: ModelChoice): Promise<void>
+  /**
+   * DSH's model catalog: the deployment default and, per provider, the models it currently
+   * offers. `default` is the stored deployment default and may name a model the settings have
+   * since deleted — only `groups` says what DSH can actually route.
+   */
+  modelCatalog(): Promise<ModelCatalogLike>
+  /**
+   * The model a session's requests use, as DSH recorded it: its own selection once it has made
+   * a request, and null before that (a new session follows DSH's default).
+   */
+  effectiveModel(sessionId: string): Promise<ModelChoice | null>
+}
+
+/** DSH's model catalog, reduced to what checking a stored choice needs. */
+export interface ModelCatalogLike {
+  readonly default: ModelChoice
+  readonly groups: readonly { readonly id: string; readonly models: readonly { readonly id: string }[] }[]
+}
+
+/** Whether DSH's catalog still offers exactly this model. */
+function catalogHas(catalog: ModelCatalogLike, choice: ModelChoice): boolean {
+  return catalog.groups.some((group) => group.id === choice.provider && group.models.some((model) => model.id === choice.model))
+}
+
+/**
+ * What a thread falls back to when its model is gone: the deployment default while the catalog
+ * still offers it, otherwise the first model it does. Null when the catalog offers none at all.
+ */
+function catalogFallback(catalog: ModelCatalogLike): ModelChoice | null {
+  const { provider, model, reasoningEffort } = catalog.default
+  if (catalogHas(catalog, catalog.default)) {
+    return reasoningEffort === undefined ? { provider, model } : { provider, model, reasoningEffort }
+  }
+  const group = catalog.groups.find((candidate) => candidate.models.length > 0)
+  const first = group?.models[0]
+  return group === undefined || first === undefined ? null : { provider: group.id, model: first.id }
+}
+
+/** `provider/model`, as messages and thread_status name a model. */
+function modelRef(choice: ModelChoice): string {
+  return `${choice.provider}/${choice.model}`
 }
 
 export interface OpenInput {
@@ -236,10 +277,12 @@ export class ThreadManager {
       await store.putThread(record)
       const agent = await host.createSession(mainSessionId, id)
       if (worktree !== null) await host.enterDirectory(id, worktreeFolder(worktree))
-      // The project's thread model; a model DSH cannot use leaves the thread on the default.
-      const threadModel = store.projectOfMain(mainSessionId)?.threadModel ?? null
-      if (threadModel !== null) {
-        await host.applyModel(id, threadModel).catch((error: unknown) => {
+      // The project's thread model, checked against DSH's catalog before it is applied: a model
+      // deleted in DSH's settings still seeds new sessions there, so a choice that is gone is
+      // dropped and the thread is moved to a model the catalog offers.
+      const choice = await this.threadModelFor(id, mainSessionId)
+      if (choice !== null) {
+        await host.applyModel(id, choice).catch((error: unknown) => {
           this.deps.warn(`dsh-threads: thread ${id} keeps the default model: ${String(error)}`)
         })
       }
@@ -258,6 +301,46 @@ export class ThreadManager {
     } finally {
       this.creating.delete(id)
     }
+  }
+
+  /**
+   * The model to give a thread that is opening: the project's stored choice while DSH's catalog
+   * still offers it, otherwise the catalog's default (or first) model — and the stored choice
+   * forgotten when it is gone. DSH seeds a new session with its deployment default without
+   * checking the catalog, so a model deleted in the settings would otherwise keep the thread
+   * running, and billing, until the provider refuses it.
+   *
+   * Reading the catalog or the session's own record is best-effort: when either fails this
+   * returns the stored choice (null when there is none), which is the thread's behaviour
+   * without any validation — a check must never keep a thread from opening.
+   */
+  private async threadModelFor(threadId: string, mainSessionId: string): Promise<ModelChoice | null> {
+    const { store, host } = this.deps
+    const project = store.projectOfMain(mainSessionId)
+    const stored = project?.threadModel ?? null
+    let catalog: ModelCatalogLike
+    let effective: ModelChoice
+    try {
+      catalog = await host.modelCatalog()
+      // A new session has no selection of its own yet, so what it will really use is the
+      // deployment default (the projection reads null until its first request).
+      effective = stored ?? (await host.effectiveModel(threadId)) ?? catalog.default
+    } catch (error) {
+      this.deps.warn(msg().modelCheckFailed(error instanceof Error ? error.message : String(error)))
+      return stored
+    }
+    if (catalogHas(catalog, effective)) return stored
+    const fallback = catalogFallback(catalog)
+    const gone = modelRef(effective)
+    const target = fallback === null ? null : modelRef(fallback)
+    if (project !== undefined && stored !== null) {
+      // The project's own choice is what went stale: forget it, so the next thread starts clean.
+      await store.putProject({ ...project, threadModel: null, updatedAt: this.deps.now() })
+      this.deps.warn(msg().staleThreadModel(gone, target))
+    } else {
+      this.deps.warn(msg().staleInheritedModel(gone, target))
+    }
+    return fallback
   }
 
   /** Start a round the main conversation asked for. The record is saved before the message is sent. */
@@ -729,7 +812,7 @@ export class ThreadManager {
   }
 
   /** Text for thread_status: every thread of this main conversation, or one thread in detail. */
-  describe(mainSessionId: string, n?: number): string {
+  async describe(mainSessionId: string, n?: number): Promise<string> {
     const m = msg()
     const marks = (thread: ThreadRecord) => `${this.isStopped(thread.id) ? m.stoppedMark : ''}${thread.resolved ? m.resolvedMark : ''}${thread.archived ? m.archivedMark : ''}`
     const threads = this.deps.store.threadsOf(mainSessionId)
@@ -739,6 +822,7 @@ export class ThreadManager {
       const report = thread.lastReport
       return [
         m.describeHead(thread.n, thread.title, thread.status, marks(thread), thread.id),
+        await this.modelLine(thread.id),
         thread.worktree === null ? '' : m.describeWorktree(thread.worktree.path, thread.worktree.branch, thread.worktree.removed),
         m.describeTask(truncate(thread.task, 600)),
         report === null
@@ -756,5 +840,19 @@ export class ThreadManager {
       const latest = t.lastReport === null ? m.listNoReport : m.listLatest(t.lastReport.status, truncate(t.lastReport.summary, 80))
       return m.listLine(t.n, t.title, t.status, marks(t), latest)
     }).join('\n')
+  }
+
+  /**
+   * The thread's current model for thread_status: what its requests use, as DSH recorded it.
+   * A thread that has not made a request yet follows DSH's default, and a session whose record
+   * cannot be read says so — neither is worth failing the whole description over.
+   */
+  private async modelLine(sessionId: string): Promise<string> {
+    try {
+      const model = await this.deps.host.effectiveModel(sessionId)
+      return model === null ? msg().describeModelUnknown : msg().describeModel(modelRef(model))
+    } catch {
+      return msg().describeModelUnknown
+    }
   }
 }

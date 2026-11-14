@@ -7,12 +7,13 @@ import { boundContextSummary, createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import { finalAssistantOutput } from '@deepseek-ai/dsh-subagent'
 import { randomUUID } from 'node:crypto'
-import type { ThreadAgent, ThreadHost } from './manager.ts'
+import type { ModelCatalogLike, ThreadAgent, ThreadHost } from './manager.ts'
 import type { ProjectHost, TokenBuckets, WorkspaceInfo } from './projects.ts'
 import { msg } from './messages.ts'
 import { textOf, truncate } from './report.ts'
 import { optional } from './services.ts'
 import { type NoticeMeta, SOURCE_KIND } from './source.ts'
+import type { ModelChoice } from './types.ts'
 import { createWorktree, removeWorktree, systemGit } from './worktree.ts'
 
 /** How much of a provider failure's message reaches the main conversation. */
@@ -146,6 +147,18 @@ export function createHost(ctx: Context): ThreadHost & ProjectHost & ReplyHost {
       const projected = await ctx.sessionController.projections({ sessionId: sessionId as SessionId } as Parameters<typeof ctx.sessionController.projections>[0], AbortSignal.timeout(5000))
       const usage = (projected as { values?: { tokenUsage?: unknown } } | null)?.values?.tokenUsage as TokenBuckets | undefined
       return usage ?? null
+    },
+
+    modelCatalog() {
+      // DSH's `default` is the stored deployment default, which a model deleted in the settings
+      // leaves behind; only the groups say what DSH can route right now.
+      return ctx.sessionController.modelCatalog() as Promise<ModelCatalogLike>
+    },
+
+    async effectiveModel(sessionId) {
+      const projected = await ctx.sessionController.projections({ sessionId: sessionId as SessionId } as Parameters<typeof ctx.sessionController.projections>[0], AbortSignal.timeout(5000))
+      const selection = (projected as { values?: { modelSelection?: { lastUsed?: ModelChoice | null } } } | null)?.values?.modelSelection
+      return selection?.lastUsed ?? null
     },
 
     async archiveSession(sessionId) {

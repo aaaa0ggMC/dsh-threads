@@ -17,7 +17,7 @@ export function threadStatusTool(manager: ThreadManager): ToolDefinition {
       const caller = exec.agent
       if (caller === undefined) throw new Error('thread_status needs a calling session')
       try {
-        return manager.describe(caller.id, args.n)
+        return await manager.describe(caller.id, args.n)
       } catch (error) {
         if (error instanceof ThreadError) return error.message
         throw error

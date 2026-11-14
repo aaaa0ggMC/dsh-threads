@@ -122,9 +122,9 @@ describe('ThreadManager', () => {
 
   it('describes threads for thread_status', async () => {
     await t.manager.open('main', { title: '查依赖', task: 'x', initiation: 'offer' })
-    expect(t.manager.describe('main')).toContain('#1「查依赖」· running')
-    expect(t.manager.describe('main', 1)).toContain('任务：x')
-    expect(() => t.manager.describe('main', 9)).toThrow(ThreadError)
+    expect(await t.manager.describe('main')).toContain('#1「查依赖」· running')
+    expect(await t.manager.describe('main', 1)).toContain('任务：x')
+    await expect(t.manager.describe('main', 9)).rejects.toBeInstanceOf(ThreadError)
   })
 
   it('only lets a project main conversation open threads', async () => {
@@ -185,7 +185,7 @@ describe('ThreadManager', () => {
     expect((await t.manager.setArchived('session-1', true)).archived).toBe(true)
     expect(t.archived.has('session-1')).toBe(true)
     await expect(t.manager.reply('main', 1, 'more')).rejects.toThrow('已被用户归档')
-    expect(t.manager.describe('main')).toContain('· 已归档')
+    expect(await t.manager.describe('main')).toContain('· 已归档')
     expect((await t.manager.setArchived('session-1', false)).archived).toBe(false)
     expect(t.archived.has('session-1')).toBe(false)
   })
@@ -249,8 +249,8 @@ describe('a stopped thread that DSH wakes for a finished background job', () => 
       expect(t.main.injects).toHaveLength(1)
       expect(t.main.injects[0]).toContain('· stopped ·')
       expect(t.store.main('main').pendingNotes).toEqual([])
-      expect(t.manager.describe('main')).toContain('· idle · 用户已停止 ·')
-      expect(t.manager.describe('main', 1)).toContain('· idle · 用户已停止（会话')
+      expect(await t.manager.describe('main')).toContain('· idle · 用户已停止 ·')
+      expect(await t.manager.describe('main', 1)).toContain('· idle · 用户已停止（会话')
     })
   }
 
@@ -275,7 +275,7 @@ describe('a stopped thread that DSH wakes for a finished background job', () => 
     await t.manager.onIdle('session-1')
     expect(t.main.injects).toHaveLength(2)
     expect(t.main.injects[1]).toContain('· done ·')
-    expect(t.manager.describe('main')).not.toContain('用户已停止')
+    expect(await t.manager.describe('main')).not.toContain('用户已停止')
   })
 
   it('runs again when the main conversation sends a follow-up', async () => {
@@ -562,7 +562,7 @@ describe('ThreadManager.markNumber', () => {
     await t.manager.open('main', { title: 'a', task: 'x', initiation: 'user_asked' })
     await t.manager.onIdle('session-1')
     expect((await t.manager.markNumber('main', 1, 'resolve')).resolved).toBe(true)
-    expect(t.manager.describe('main')).toContain('· 已解决')
+    expect(await t.manager.describe('main')).toContain('· 已解决')
     // Marking it solved again changes nothing (the record is not even written).
     const marked = t.store.thread('session-1')!
     expect((await t.manager.markNumber('main', 1, 'resolve')).updatedAt).toBe(marked.updatedAt)
@@ -573,7 +573,7 @@ describe('ThreadManager.markNumber', () => {
     expect(t.archived.has('session-1')).toBe(true)
     // Archiving it again changes nothing either.
     expect((await t.manager.markNumber('main', 1, 'archive')).updatedAt).toBe(t.store.thread('session-1')!.updatedAt)
-    expect(t.manager.describe('main')).toContain('· 已归档')
+    expect(await t.manager.describe('main')).toContain('· 已归档')
     expect((await t.manager.markNumber('main', 1, 'unarchive')).archived).toBe(false)
     expect(t.archived.has('session-1')).toBe(false)
   })
@@ -608,10 +608,119 @@ describe('thread model', () => {
     await t.store.putProject({ ...project, threadModel: { provider: 'deepseek', model: 'deepseek-pro', reasoningEffort: 'high' } })
     await t.manager.open('main', { title: 'a', task: 'a', initiation: 'user_asked' })
     expect(t.models).toEqual(['session-1:deepseek/deepseek-pro'])
+    // A stored choice the catalog still offers is left exactly as it was.
+    expect(t.warnings).toEqual([])
+    expect(t.store.projectOfMain('main')!.threadModel).toEqual({ provider: 'deepseek', model: 'deepseek-pro', reasoningEffort: 'high' })
 
     await t.store.putProject({ ...project, threadModel: { provider: 'deepseek', model: 'missing' } })
     const thread = await t.manager.open('main', { title: 'b', task: 'b', initiation: 'user_asked' })
     expect(thread.status).toBe('running')
+  })
+
+  it('forgets a stored thread model the catalog no longer offers, and moves the thread to the default', async () => {
+    const t = setup()
+    const project = t.store.projectOfMain('main')!
+    await t.store.putProject({ ...project, threadModel: { provider: 'deepseek', model: 'missing' } })
+    const thread = await t.manager.open('main', { title: 'a', task: 'a', initiation: 'user_asked' })
+    expect(thread.status).toBe('running')
+    // The stale choice is never handed to DSH; the catalog's default is.
+    expect(t.models).toEqual(['session-1:deepseek/deepseek-chat'])
+    expect(t.warnings.join('\n')).toContain('项目里存的讨论串模型 deepseek/missing 已不在 DSH 的模型目录里，已清空；这个讨论串改用 deepseek/deepseek-chat')
+    // Self-healed: the next thread opens on the default instead of tripping over it again.
+    expect(t.store.projectOfMain('main')!.threadModel).toBeNull()
+  })
+
+  it('moves a thread off a default model the settings deleted (the stale-seeding bug)', async () => {
+    // The project never chose a model, so DSH seeds the session with its deployment default —
+    // which the settings left naming a deleted model (docs/bug-thread-stale-model.md).
+    const t = setup()
+    t.catalog.default = { provider: 'openrouter', model: 'claude-opus' }
+    const thread = await t.manager.open('main', { title: 'a', task: 'a', initiation: 'user_asked' })
+    expect(thread.status).toBe('running')
+    // The deleted default is not in the catalog either, so the thread takes the first model that is.
+    expect(t.models).toEqual(['session-1:deepseek/deepseek-chat'])
+    expect(t.warnings.join('\n')).toContain('这个讨论串默认会用 openrouter/claude-opus')
+    expect(t.store.projectOfMain('main')!.threadModel).toBeNull()
+  })
+
+  it('moves a thread off a stale selection its session already recorded', async () => {
+    const t = setup()
+    t.effectiveModels.set('session-1', { provider: 'openrouter', model: 'claude-opus' })
+    const thread = await t.manager.open('main', { title: 'a', task: 'a', initiation: 'user_asked' })
+    expect(thread.status).toBe('running')
+    expect(t.models).toEqual(['session-1:deepseek/deepseek-chat'])
+    expect(t.warnings.join('\n')).toContain('这个讨论串默认会用 openrouter/claude-opus')
+  })
+
+  it('leaves the thread on the default when the effective model is in the catalog', async () => {
+    const t = setup()
+    t.effectiveModels.set('session-1', { provider: 'step-plan', model: 'step-5-preview' })
+    const thread = await t.manager.open('main', { title: 'a', task: 'a', initiation: 'user_asked' })
+    expect(thread.status).toBe('running')
+    // Nothing to fix: the thread keeps the model it would have used anyway.
+    expect(t.models).toEqual([])
+    expect(t.warnings).toEqual([])
+  })
+
+  it('opens the thread as before when the catalog cannot be read', async () => {
+    const t = setup()
+    t.failCatalog()
+    const thread = await t.manager.open('main', { title: 'a', task: 'a', initiation: 'user_asked' })
+    expect(thread.status).toBe('running')
+    expect(t.models).toEqual([])
+    expect(t.warnings.join('\n')).toContain('没法对照 DSH 的模型目录校验讨论串的模型')
+
+    // A stored choice is still applied: the check is skipped, not the thread's model.
+    const project = t.store.projectOfMain('main')!
+    await t.store.putProject({ ...project, threadModel: { provider: 'deepseek', model: 'deepseek-pro' } })
+    await t.manager.open('main', { title: 'b', task: 'b', initiation: 'user_asked' })
+    expect(t.models).toEqual(['session-2:deepseek/deepseek-pro'])
+  })
+
+  it('opens the thread as before when the session projection cannot be read', async () => {
+    const t = setup()
+    t.failEffectiveModel()
+    const thread = await t.manager.open('main', { title: 'a', task: 'a', initiation: 'user_asked' })
+    expect(thread.status).toBe('running')
+    // No stored choice and no readable projection: the thread follows DSH's default, as before.
+    expect(t.models).toEqual([])
+    expect(t.warnings.join('\n')).toContain('没法对照 DSH 的模型目录校验讨论串的模型')
+  })
+
+  it('says so when the catalog has no model to move the thread to', async () => {
+    const t = setup()
+    t.catalog.groups = []
+    const project = t.store.projectOfMain('main')!
+    await t.store.putProject({ ...project, threadModel: { provider: 'deepseek', model: 'missing' } })
+    const thread = await t.manager.open('main', { title: 'a', task: 'a', initiation: 'user_asked' })
+    expect(thread.status).toBe('running')
+    expect(t.models).toEqual([])
+    expect(t.warnings.join('\n')).toContain('目录里也没有可用模型')
+    expect(t.store.projectOfMain('main')!.threadModel).toBeNull()
+  })
+})
+
+describe('thread_status model', () => {
+  it('shows the model the thread currently uses', async () => {
+    const t = setup()
+    await t.manager.open('main', { title: 'a', task: 'x', initiation: 'user_asked' })
+    t.effectiveModels.set('session-1', { provider: 'deepseek', model: 'deepseek-pro' })
+    expect(await t.manager.describe('main', 1)).toContain('模型：deepseek/deepseek-pro')
+    // The list stays model-free: one projection read per call is enough for the detail view.
+    expect(await t.manager.describe('main')).not.toContain('模型：')
+  })
+
+  it('says the model is unknown when the session has no record of one', async () => {
+    const t = setup()
+    await t.manager.open('main', { title: 'a', task: 'x', initiation: 'user_asked' })
+    expect(await t.manager.describe('main', 1)).toContain('模型：未知/默认')
+  })
+
+  it('says the model is unknown when its record cannot be read', async () => {
+    const t = setup()
+    await t.manager.open('main', { title: 'a', task: 'x', initiation: 'user_asked' })
+    t.failEffectiveModel()
+    expect(await t.manager.describe('main', 1)).toContain('模型：未知/默认')
   })
 })
 

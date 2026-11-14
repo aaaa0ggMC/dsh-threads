@@ -3,7 +3,7 @@ import { Config } from '../src/config.ts'
 import { type ThreadAgent, type ThreadHost, ThreadManager } from '../src/manager.ts'
 import type { NoticeMeta } from '../src/source.ts'
 import { memoryStore, type ThreadStore } from '../src/store.ts'
-import type { RoundFailure, ThreadWorktree } from '../src/types.ts'
+import type { ModelChoice, RoundFailure, ThreadWorktree } from '../src/types.ts'
 import { WorktreeError } from '../src/worktree.ts'
 
 export class FakeAgent implements ThreadAgent {
@@ -26,9 +26,12 @@ export function setup(overrides: Partial<Config> = {}, options: { slowWrites?: b
   const failures = new Map<string, RoundFailure>()
   const renamed: string[] = []
   const inherited: string[] = []
+  const warnings: string[] = []
   let failCreate = false
   let notARepo = false
   let unreachableMain = false
+  let failCatalog = false
+  let failEffectiveModel = false
   let subdir = ''
   const entered: string[] = []
   const models: string[] = []
@@ -36,6 +39,19 @@ export function setup(overrides: Partial<Config> = {}, options: { slowWrites?: b
   /** Threads whose latest turn the user stopped. */
   const stopped = new Set<string>()
   const archived = new Set<string>()
+  /**
+   * DSH's model catalog as the fake host serves it: the deployment default (which the settings
+   * can leave stale) and the models each provider currently offers. Tests may edit it.
+   */
+  const catalog = {
+    default: { provider: 'deepseek', model: 'deepseek-chat' } as ModelChoice,
+    groups: [
+      { id: 'deepseek', models: [{ id: 'deepseek-chat' }, { id: 'deepseek-pro' }] },
+      { id: 'step-plan', models: [{ id: 'step-5-preview' }] },
+    ],
+  }
+  /** What each session's model requests used, as DSH's modelSelection projection records it. */
+  const effectiveModels = new Map<string, ModelChoice | null>()
   const host: ThreadHost = {
     async createSession(_main, id) {
       if (failCreate) throw new Error('create failed')
@@ -78,6 +94,14 @@ export function setup(overrides: Partial<Config> = {}, options: { slowWrites?: b
       if (choice.model === 'missing') throw new Error('session/model-unavailable')
       models.push(`${id}:${choice.provider}/${choice.model}`)
     },
+    async modelCatalog() {
+      if (failCatalog) throw new Error('catalog unavailable')
+      return catalog
+    },
+    async effectiveModel(id) {
+      if (failEffectiveModel) throw new Error('projections unavailable')
+      return effectiveModels.get(id) ?? null
+    },
   }
   const main = new FakeAgent('main')
   agents.set('main', main)
@@ -96,7 +120,7 @@ export function setup(overrides: Partial<Config> = {}, options: { slowWrites?: b
     now: () => new Date(Date.UTC(2026, 9, 23, 0, 0, clock++)).toISOString(),
     newSessionId: () => `session-${++ids}`,
     newProposalId: () => `proposal-${++ids}`,
-    warn: () => {},
+    warn: (message) => { warnings.push(message) },
   })
   // 'main' is a project's main conversation; only those dispatch threads.
   void store.putProject({
@@ -104,5 +128,5 @@ export function setup(overrides: Partial<Config> = {}, options: { slowWrites?: b
     pinned: false, instructions: '', icon: 'folder', goal: '', archived: false, notify: 'attention',
     mainModel: null, threadModel: null, createdAt: '', updatedAt: '',
   })
-  return { manager, store, main, agents, outputs, failures, renamed, inherited, entered, removals, models, stopped, archived, failCreate: () => { failCreate = true }, notARepo: () => { notARepo = true }, unreachableMain: () => { unreachableMain = true }, subdir: (value: string) => { subdir = value } }
+  return { manager, store, main, agents, outputs, failures, renamed, inherited, entered, removals, models, stopped, archived, catalog, effectiveModels, warnings, failCreate: () => { failCreate = true }, notARepo: () => { notARepo = true }, unreachableMain: () => { unreachableMain = true }, failCatalog: () => { failCatalog = true }, failEffectiveModel: () => { failEffectiveModel = true }, subdir: (value: string) => { subdir = value } }
 }

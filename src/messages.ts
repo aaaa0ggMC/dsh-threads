@@ -43,6 +43,17 @@ const zh = {
   cleanupRemoved: (n: number, branch: string, kept: boolean) =>
     `#${n}：已删除 worktree，${kept ? `分支 ${branch} 还有没合并的提交，保留` : `分支 ${branch} 已合并，一并删除`}。`,
 
+  // Model checks when a thread opens (src/manager.ts openNow)
+  staleThreadModel: (model: string, fallback: string | null) =>
+    fallback === null
+      ? `项目里存的讨论串模型 ${model} 已不在 DSH 的模型目录里，已清空；目录里也没有可用模型，这个讨论串先按默认开。`
+      : `项目里存的讨论串模型 ${model} 已不在 DSH 的模型目录里，已清空；这个讨论串改用 ${fallback}。`,
+  staleInheritedModel: (model: string, fallback: string | null) =>
+    fallback === null
+      ? `这个讨论串默认会用 ${model}，但它已不在 DSH 的模型目录里；目录里也没有可用模型，先按默认开。`
+      : `这个讨论串默认会用 ${model}，但它已不在 DSH 的模型目录里，已改用 ${fallback}。`,
+  modelCheckFailed: (reason: string) => `没法对照 DSH 的模型目录校验讨论串的模型（${reason}）：按现状开讨论串。`,
+
   // thread_status (manager.describe)
   noSuchThread: (n: number) => `没有讨论串 #${n}。`,
   noThreads: '这个主对话还没有讨论串。',
@@ -50,6 +61,8 @@ const zh = {
   stoppedMark: ' · 用户已停止',
   resolvedMark: ' · 已解决',
   describeHead: (n: number, title: string, status: string, marks: string, id: string) => `讨论串 #${n}「${title}」· ${status}${marks}（会话 ${id}）`,
+  describeModel: (model: string) => `模型：${model}`,
+  describeModelUnknown: '模型：未知/默认',
   describeWorktree: (path: string, branch: string, removed: boolean) => `worktree：${path}，分支 ${branch}${removed ? '（已删除 worktree）' : ''}`,
   describeTask: (task: string) => `任务：${task}`,
   describeNoReport: '最新回报：无',
@@ -189,12 +202,24 @@ const en: Messages = {
   cleanupRemoved: (n, branch, kept) =>
     `#${n}: worktree removed; ${kept ? `branch ${branch} has unmerged commits and was kept` : `branch ${branch} was merged and was deleted too`}.`,
 
+  staleThreadModel: (model, fallback) =>
+    fallback === null
+      ? `The project's thread model ${model} is no longer in DSH's model catalog, so it was cleared; the catalog has no usable model either, so this thread opens on the default.`
+      : `The project's thread model ${model} is no longer in DSH's model catalog, so it was cleared; this thread uses ${fallback} instead.`,
+  staleInheritedModel: (model, fallback) =>
+    fallback === null
+      ? `This thread would have used ${model} by default, but it is no longer in DSH's model catalog, and the catalog has no usable model either, so it opens on the default.`
+      : `This thread would have used ${model} by default, but it is no longer in DSH's model catalog, so it uses ${fallback} instead.`,
+  modelCheckFailed: (reason) => `The thread's model could not be checked against DSH's model catalog (${reason}); the thread opens as before.`,
+
   noSuchThread: (n) => `No thread #${n}.`,
   noThreads: 'This main conversation has no threads yet.',
   archivedMark: ' · archived',
   stoppedMark: ' · stopped by the user',
   resolvedMark: ' · resolved',
   describeHead: (n, title, status, marks, id) => `Thread #${n} "${title}" · ${status}${marks} (session ${id})`,
+  describeModel: (model) => `Model: ${model}`,
+  describeModelUnknown: 'Model: unknown/default',
   describeWorktree: (path, branch, removed) => `Worktree: ${path}, branch ${branch}${removed ? ' (worktree removed)' : ''}`,
   describeTask: (task) => `Task: ${task}`,
   describeNoReport: 'Latest report: none',

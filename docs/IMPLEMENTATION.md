@@ -200,7 +200,7 @@ docs/Plan.md 定了方向：在 DeepSeek Harness（DSH）里做一个插件—�
 - `thread_open { title, task, initiation: 'user_asked' | 'offer' | 'proposal' }`
   - 返回讨论串序号和 id，或者提议的序号。
   - 超过并发上限时直接报错，告诉模型等某个讨论串结束。
-- `thread_status { n? }`：列出本主会话的讨论串和提议，或返回一个讨论串的最新回报。
+- `thread_status { n? }`：列出本主会话的讨论串和提议，或返回一个讨论串的最新回报。详情（传 `n`）在标题行下面带一行「模型：<provider>/<model>」——该讨论串当前请求实际使用的模型（DSH 的 `modelSelection` 投影），没有记录或读不到时是「未知/默认」；列表视图不带（每个讨论串都要读一次投影）。
 - `thread_reply { n, message, mode? }`：给讨论串追加指令。`mode: 'steer'`（默认）直接插进它正在做的事：运行中的讨论串在下一步就读到，不用等这一轮结束；`mode: 'followup'` 则排成它自己的下一轮，当前这一轮结束后才开始。空闲的讨论串两种都立刻开一轮。
 - `thread_mark { n, action: 'resolve' | 'reopen' | 'archive' | 'unarchive' }`：按 #n 标记已解决 / 重新打开、归档 / 取消归档（原来只有用户能在浏览器面板里做）。`resolve` 只改记录状态（不碰会话、不发通知，用户在它里面发消息会重新打开）；`archive` / `unarchive` 走 `setArchived`，在 DSH 里归档 / 取消归档会话。运行中归档被拒绝，要求先停止；重复标记幂等。
 
@@ -1051,6 +1051,35 @@ DSH 的两种投递（核对的是 `@deepseek-ai/dsh-agent` 的类型声明和 `
 - 测试：`tests/manager.test.ts` 的 `ThreadManager.markNumber`（按 n 解析、四种 action、重复标记幂等不写存储、运行中归档被拒、只标记本主对话的线程）；`tests/tools.test.ts` 的 `thread_mark`（成功文案、未知 n 和未知 action、运行中归档的拒绝文案）；`tests/install.test.ts` 的 dispatcher 工具清单加上 `thread_mark`。
 - 实机验证（待做）：在桌面版里让主对话对做完的讨论串调 `thread_mark`，检查列表、标题栏计数、输入框锁定和 `thread_status` 的显示。
 
+#### 开线程时校验并自愈线程模型（2026-11-14，分支 `fix/validate-thread-model`）
+
+背景见 `docs/bug-thread-stale-model.md`：在 DSH 设置里删掉模型后，新开的讨论串仍用该模型并真实计费（44 步，直到 402）。根因在 DSH（删除模型不级联、不校验 `agent-default-model`；新会话用无校验的陈旧部署默认 seeding；会话级选择耐久、永不重校验），插件侧只是放大后果：`threadModel` 为 null 时完全继承 DSH 默认，开线程时从不校验有效模型。本条目落地该文档「插件侧可行修复」的第 1 条（校验 + 自愈，直接挡住继续花钱）和第 3 条（可观测性）；第 2 条（设置 UI 对失效选择提示、拒绝失效选择）和第 4 条（`applyModel` 存回默认的隐患）没做。
+
+**做法**：
+
+- `ThreadHost` 多两个能力（`src/host.ts` 实现，`src/manager.ts` 声明）：
+  - `modelCatalog()`：直接转 DSH 的 `sessionController.modelCatalog()`。形状是 `{ default, groups: [{ id, models: [{ id, … }] }] }`；`default` 是**存下来的**部署默认，设置里删掉模型它不会变（`buildModelCatalog` 原样复制 `agentDefaultModel.currentSelection()`），只有 `groups` 说明 DSH 现在能路由什么。
+  - `effectiveModel(sessionId)`：读 `sessionController.projections({ sessionId })` 的 `values.modelSelection.lastUsed`（和 `sessionUsage` 同一个 RPC、同一种写法，5 秒超时）。没有记录时返回 null——新会话还没发过请求，它会用 DSH 的部署默认。
+- `openNow` 在 `host.createSession` 之后、派发之前走 `threadModelFor`（`src/manager.ts`）：
+  - 项目存了 `threadModel`：对照目录校验。仍在目录里 ⇒ 照旧 `applyModel`（行为不变，测试守着）；已不在 ⇒ **不**把这个选择交给 DSH（交了也是 `selectModel` 报 `session/model-unavailable`），改成目录默认或首个可用模型，`deps.warn`，并把项目记录里的 `threadModel` 清成 null 写回 store（自愈：下次开线程直接从默认走，不会每次都被同一个失效选择绊一次）。
+  - 项目没存 `threadModel`（null，跟随默认）：读新会话的有效模型——投影没有记录就回落到 `modelCatalog().default`，那正是 DSH 会 seeding 给这个会话的模型。不在目录里 ⇒ `applyModel` 到目录默认/首个可用模型并 warn；在目录里 ⇒ 什么都不做，和以前一样继承。
+  - 目录或投影读不到（抛错）⇒ 只 warn（`modelCheckFailed`），然后按现状开线程：有存储的选择就照旧 apply，没有就继承默认。**校验绝不能挡住开线程**——退化后的行为就是本功能之前的行为。
+- 回退顺序（`catalogFallback`）：目录默认（只在目录里还找得到它时才用，连它一起失效是常态）→ 首个可用模型（第一个非空 group 的第一个模型）→ 空目录就什么都不 apply，warn 里说明白。
+- 可观测性：`thread_status` 的详情（`manager.describe(main, n)`）在标题行下面多一行「模型：`<provider>/<model>`」，读法同上；投影没有记录或读不到时是「模型：未知/默认」。`describe` 因此变成 `async`（唯一调用方 `thread_status` 工具本来就是 async，改成 `await`；工具里对 `ThreadError` 的捕获因此也必须 `await` 后才生效）。列表视图不加模型：每个讨论串一次投影读取不值当。
+- 文案走 `msg()`（中英双语）：`staleThreadModel`、`staleInheritedModel`、`modelCheckFailed`、`describeModel`、`describeModelUnknown`。
+
+**测试**（`tests/manager.test.ts`，假 host 在 `tests/fixtures.ts` 里补了 `modelCatalog` / `effectiveModel` 两个假实现：目录是 `{ default, groups }` 的对象、投影是一张 `sessionId → ModelChoice | null` 的表，另有两个开关让任一读取抛错）：
+
+- 存储的 `threadModel` 已失效 ⇒ 不 apply 失效选择、apply 目录默认、项目记录被清成 null、warn 说明；
+- `threadModel` 为 null 且继承的默认已不在目录 ⇒ 自愈到目录默认 + warn（覆盖「投影记录的 selection 已失效」和「目录默认本身已失效」两种来法）；
+- `threadModel` 有效 ⇒ 不被改动，没有 warn（不回归现有行为）；
+- 目录读取出错 ⇒ 不挡住开线程，退化成现状（有存储选择时照旧 apply），warn；
+- 投影读取出错 ⇒ 不挡住开线程，按默认继承，warn；
+- 目录为空 ⇒ 清掉失效选择但无从替换，warn 说明，线程照常开；
+- `thread_status` 详情显示当前有效模型；没有记录、读不到时显示「未知/默认」。
+
+**没在真实 DSH 里测的**：删模型再开线程的完整场景（需要动设置里的模型列表）。单元测试覆盖了上述每条路径；`modelCatalog` / `projections` 的调用方式与 `sessionUsage`、`models.catalog`（项目设置 UI 一直在用）相同。
+
 ## 六、验证
 
 1. 本地自动检查：`npm run typecheck && npm test && npm run build`，全部通过；`dist/` 里的 `client.js` 以 `window.__ModuleLoader__.load(` 开头。
@@ -1097,6 +1126,8 @@ DSH 的两种投递（核对的是 `@deepseek-ai/dsh-agent` 的类型声明和 `
 | `agent.inject` 的消息留在收件箱，直到主对话下一轮；这期间退出 DSH 会提示“任务将会中断” | 安静回报（用户自己聊的、被停止的轮次） | 只是提示，回报已写进日志 |
 | `workspaceRegistry.archiveSession(id, { stopActivity: false })` 在会话运行时抛错；归档的会话从侧栏消失、不能运行 | 归档项目、归档讨论串 | 归档时把运行中的讨论串一起停掉，或者归档失败 |
 | `sessionController.projections({ sessionId })` 的 `values.tokenUsage`（会话没加载也能读） | 项目设置里的“使用情况” | 用量全是 0 |
+| `sessionController.projections({ sessionId })` 的 `values.modelSelection.lastUsed`（会话没加载也能读；没有记录时是 null） | 开线程时校验线程的有效模型（`host.effectiveModel`）；`thread_status` 详情里的「模型：」行 | 校验退化成“只 warn、按现状开线程”；`thread_status` 显示「未知/默认」 |
+| `sessionController.modelCatalog()` 的 `groups`（provider id + 各 provider 的 model id）与 `default`（存的部署默认，可能已失效） | 同上：对照目录判断模型是否还能路由，挑回退模型 | 同上 |
 | `connection.fetch.register` 只放行 owner principal；桌面版 `dsh-app://app/*` 带 cookie 转发 | 浏览器 ↔ 宿主的唯一通道 `POST /api/dsh-threads` | 整个界面拿不到数据 |
 | 插槽名和作用域（`CLIENT_SLOT_API`）：`sidebar.panellist`、`main`、`shell.overlay`、`sidebar.right.pane.tab`、`conversation.session.header.actions`、`conversation.chat.node`、`conversation.chat.turnTail`、`conversation.input.dock`、`conversation.composer`、`sidebar.workspaces.session.menu.item`（0.2.2 起是“旧式”菜单插槽，排在归档之前） | 浏览器端所有入口 | 对应的入口不显示 |
 
@@ -1113,6 +1144,7 @@ DSH 的两种投递（核对的是 `@deepseek-ai/dsh-agent` 的类型声明和 `
 | 6b | 开一个讨论串：把 `sleep 40; echo x` 放进后台任务，不等它，先回报“已启动”就结束这一轮，任务结束后再回报 | 主对话被唤醒两次；第二条便条带“补交的回报”那一行，卡片显示第二份回报 |
 | 7 | 归档、取消归档一个讨论串；归档、取消归档项目 | 列表、计数、侧栏都跟着变 |
 | 8 | 项目设置：换协调器模型和讨论串模型 | 生效，DSH 的全局默认模型不变 |
+| 8b | 在 DSH 设置里删掉项目「讨论串模型」选的那个模型（provider 保留），再从主对话开一个讨论串；`thread_status { n: 1 }` | 讨论串用在目录默认（或首个可用模型）上，不是被删的那个；控制台有一条 warn；项目记录里的 `threadModel` 被清成默认；`thread_status` 详情带「模型：」行 |
 | 9 | 主对话设成 ask 模式，开一个写文件的讨论串（隔离的官方 DSH，§六 第 8 条） | 讨论串弹审批，不自动通过 |
 | 10 | 切换 DSH 的界面语言 | `/thread stop 99` 的回复跟着换语言 |
 | 11 | 把窗口缩到 767px 以下（没装 dsh-web-mobile）：项目页、新建项目、项目设置、项目菜单 | 一列卡片，对话框不超出窗口、内容能滚动，通知档位直接列在菜单里；项目页顶部没有多出的空白 |
